@@ -60,6 +60,16 @@ public class Matrix {
         return result;
     }
 
+    public static Matrix outerProduct(Vector a, Vector b) {
+        Matrix result = new Matrix(a.size(), b.size());
+        for (int i = 0; i < a.size(); i++) {
+            for (int j = 0; j < b.size(); j++) {
+                result.set(i, j, a.get(i) * b.get(j));
+            }
+        }
+        return result;
+    }
+
     public Matrix transpose() {
         Matrix result = new Matrix(this.cols, this.rows);
         for (int r = 0; r < rows; r++) {

@@ -61,6 +61,15 @@ public class Vector {
         return sum;
     }
 
+    public Vector multiplyElementwise(Vector other) {
+        checkSameSize(other);
+        Vector result = new Vector(size());
+        for (int i = 0; i < size(); i++) {
+            result.set(i, this.get(i) * other.get(i));
+        }
+        return result;
+    }
+
     private void checkSameSize(Vector other) {
         if (this.size() != other.size()) {
             throw new IllegalArgumentException(
