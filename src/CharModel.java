@@ -3,15 +3,6 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.*;
 
-/**
- * A character-level language model built from simple counting, not
- * gradient descent. Given the last N characters, it tracks which
- * character came next in the training text, then generates new text
- * by repeatedly sampling from those learned distributions.
- *
- * This is the same fundamental idea as GPT's next-token prediction --
- * just using frequency counts instead of a trained neural network.
- */
 public class CharModel {
 
     private final int contextLength;
@@ -22,7 +13,6 @@ public class CharModel {
         this.contextLength = contextLength;
     }
 
-    /** Slide a window over the text, counting what character follows each context. */
     public void train(String text) {
         for (int i = 0; i + contextLength < text.length(); i++) {
             String context = text.substring(i, i + contextLength);
@@ -32,7 +22,6 @@ public class CharModel {
         }
     }
 
-    /** Generate new text by repeatedly sampling the next character. */
     public String generate(String seed, int length) {
         StringBuilder output = new StringBuilder(seed);
         String context = seed;
@@ -46,7 +35,6 @@ public class CharModel {
         return output.toString();
     }
 
-    /** Weighted random pick: characters that followed this context more often get picked more often. */
     private char sample(Map<Character, Integer> counts) {
         int total = counts.values().stream().mapToInt(Integer::intValue).sum();
         int r = random.nextInt(total);
@@ -58,11 +46,16 @@ public class CharModel {
         return counts.keySet().iterator().next();
     }
 
+    /** Whether this exact context was seen during training (used by the chat loop to fall back gracefully). */
+    public boolean knowsContext(String context) {
+        return transitions.containsKey(context);
+    }
+
     public static void main(String[] args) throws IOException {
         String text = Files.readString(Paths.get("shakespeare.txt"));
         System.out.println("Loaded " + text.length() + " characters of training text.");
 
-        int contextLength = 6; // try 3 for more chaos, 10 for more memorization
+        int contextLength = 6;
         CharModel model = new CharModel(contextLength);
 
         long start = System.currentTimeMillis();
