@@ -1,18 +1,11 @@
 import java.util.*;
 
-/**
- * Step 8: everything combined into one real, trainable mini-transformer.
- * Trainable character embeddings + trainable self-attention (Q/K/V) +
- * a trainable output layer, all trained together via backpropagation.
- * This is the actual architecture family GPT belongs to -- just one
- * tiny layer instead of dozens of large ones.
- */
 public class MiniTransformer {
 
     int vocabSize, d, contextLength;
-    Matrix embeddingTable; // vocabSize x d
-    Matrix Wq, Wk, Wv;     // d x d
-    Matrix Wout;           // d x vocabSize
+    Matrix embeddingTable;
+    Matrix Wq, Wk, Wv;
+    Matrix Wout;
     double learningRate;
     Map<Character, Integer> charToIndex = new HashMap<>();
     char[] indexToChar;
@@ -153,6 +146,37 @@ public class MiniTransformer {
         return indexToChar[best];
     }
 
+    public char sampleNext(String context, Random rand) {
+        int T = contextLength;
+        Matrix X = new Matrix(T, d);
+        for (int i = 0; i < T; i++) {
+            int ci = charToIndex.get(context.charAt(i));
+            for (int k = 0; k < d; k++) X.set(i, k, embeddingTable.get(ci, k));
+        }
+        Matrix Q = X.multiply(Wq);
+        Matrix K = X.multiply(Wk);
+        Matrix V = X.multiply(Wv);
+        Vector qLast = getRow(Q, T - 1);
+        double[] scores = new double[T];
+        for (int j = 0; j < T; j++) scores[j] = qLast.dot(getRow(K, j)) / Math.sqrt(d);
+        double[] attn = softmax(scores);
+        Vector h = new Vector(d);
+        for (int j = 0; j < T; j++) {
+            Vector vj = getRow(V, j);
+            for (int k = 0; k < d; k++) h.set(k, h.get(k) + attn[j] * vj.get(k));
+        }
+        Vector logits = Wout.transpose().multiply(h);
+        double[] probs = softmax(vectorToArray(logits));
+
+        double r = rand.nextDouble();
+        double cumulative = 0;
+        for (int i = 0; i < probs.length; i++) {
+            cumulative += probs[i];
+            if (r < cumulative) return indexToChar[i];
+        }
+        return indexToChar[probs.length - 1];
+    }
+
     private static void addInPlace(Matrix a, Matrix b) {
         for (int r = 0; r < a.rows(); r++) for (int c = 0; c < a.cols(); c++) a.set(r, c, a.get(r, c) + b.get(r, c));
     }
@@ -189,29 +213,20 @@ public class MiniTransformer {
     }
 
     public static void main(String[] args) {
-        // Sanity check: a trivial repeating pattern the model should learn perfectly.
         String text = "abcabcabcabcabcabcabcabcabcabc";
         int T = 3;
         MiniTransformer model = new MiniTransformer(text, T, 8, 0.1);
-
         int epochs = 300;
         for (int epoch = 0; epoch < epochs; epoch++) {
-            double totalLoss = 0;
-            int count = 0;
             for (int i = 0; i + T < text.length(); i++) {
-                totalLoss += model.trainStep(text.substring(i, i + T), text.charAt(i + T));
-                count++;
+                model.trainStep(text.substring(i, i + T), text.charAt(i + T));
             }
-            if (epoch % 50 == 0) System.out.printf("Epoch %d: avg loss = %.4f%n", epoch, totalLoss / count);
         }
-
         int correct = 0, total = 0;
         for (int i = 0; i + T < text.length(); i++) {
-            char predicted = model.predict(text.substring(i, i + T));
-            char actual = text.charAt(i + T);
+            if (model.predict(text.substring(i, i + T)) == text.charAt(i + T)) correct++;
             total++;
-            if (predicted == actual) correct++;
         }
-        System.out.println("\nSanity check accuracy: " + correct + "/" + total + " (should be perfect -- proves embeddings + attention + output layer all learn correctly together)");
+        System.out.println("Sanity check: " + correct + "/" + total);
     }
 }
