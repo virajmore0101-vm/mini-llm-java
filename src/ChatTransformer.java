@@ -4,17 +4,13 @@ import java.nio.file.Paths;
 import java.util.Random;
 import java.util.Scanner;
 
-/**
- * Step 10: the chat loop from step 6, but powered by the real trainable
- * transformer from steps 8-9 instead of simple n-gram counting.
- */
 public class ChatTransformer {
     public static void main(String[] args) throws IOException {
         String text = Files.readString(Paths.get("shakespeare.txt")).substring(0, 2000);
         int T = 8;
 
-        System.out.println("Training the transformer on " + text.length() + " characters... (about 10 seconds)");
-        MiniTransformer model = new MiniTransformer(text, T, 16, 0.03);
+        System.out.println("Training the 2-layer transformer on " + text.length() + " characters... (about 20 seconds)");
+        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 16, 2, 0.02);
         for (int epoch = 0; epoch < 150; epoch++) {
             for (int i = 0; i + T < text.length(); i++) {
                 model.trainStep(text.substring(i, i + T), text.charAt(i + T));
@@ -43,7 +39,7 @@ public class ChatTransformer {
         scanner.close();
     }
 
-    private static String findSeed(MiniTransformer model, String text, String input, int T, Random rand) {
+    private static String findSeed(MultiLayerTransformer model, String text, String input, int T, Random rand) {
         if (input.length() >= T) {
             String candidate = input.substring(input.length() - T);
             boolean known = true;
