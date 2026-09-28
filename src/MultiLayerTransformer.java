@@ -34,9 +34,15 @@ public class MultiLayerTransformer {
         Matrix X = new Matrix(T, d);
         for (int i = 0; i < T; i++) {
             int ci = charToIndex.get(context.charAt(i));
-            for (int k = 0; k < d; k++) X.set(i, k, embeddingTable.get(ci, k));
+            for (int k = 0; k < d; k++) X.set(i, k, embeddingTable.get(ci, k) + positionalEncoding(i, k));
         }
         return X;
+    }
+
+    /** Fixed sinusoidal position signal, so the model knows WHERE each character sits, not just what it is. */
+    private double positionalEncoding(int pos, int k) {
+        double angle = pos / Math.pow(10000, (2.0 * (k / 2)) / d);
+        return (k % 2 == 0) ? Math.sin(angle) : Math.cos(angle);
     }
 
     private Matrix forwardLayers(Matrix X) {
@@ -142,6 +148,6 @@ public class MultiLayerTransformer {
             if (model.predict(text.substring(i, i + T)) == text.charAt(i + T)) correct++;
             total++;
         }
-        System.out.println("Sanity check (2 stacked layers): " + correct + "/" + total);
+        System.out.println("Sanity check (2 stacked layers + positional encoding): " + correct + "/" + total);
     }
 }
