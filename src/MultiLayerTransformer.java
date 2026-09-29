@@ -4,6 +4,7 @@ public class MultiLayerTransformer {
     int vocabSize, d, contextLength, numLayers;
     Matrix embeddingTable;
     AttentionLayer[] layers;
+    FeedForward[] feedforwards;
     Matrix Wout;
     double learningRate;
     Map<Character, Integer> charToIndex = new HashMap<>();
@@ -25,7 +26,11 @@ public class MultiLayerTransformer {
         Random rand = new Random(7);
         embeddingTable = AttentionLayer.randomMatrix(vocabSize, d, rand, 0.5);
         layers = new AttentionLayer[numLayers];
-        for (int i = 0; i < numLayers; i++) layers[i] = new AttentionLayer(d, rand);
+        feedforwards = new FeedForward[numLayers];
+        for (int i = 0; i < numLayers; i++) {
+            layers[i] = new AttentionLayer(d, rand);
+            feedforwards[i] = new FeedForward(d, d * 4, rand);
+        }
         Wout = AttentionLayer.randomMatrix(d, vocabSize, rand, 0.5);
     }
 
@@ -39,7 +44,6 @@ public class MultiLayerTransformer {
         return X;
     }
 
-    /** Fixed sinusoidal position signal, so the model knows WHERE each character sits, not just what it is. */
     private double positionalEncoding(int pos, int k) {
         double angle = pos / Math.pow(10000, (2.0 * (k / 2)) / d);
         return (k % 2 == 0) ? Math.sin(angle) : Math.cos(angle);
@@ -47,7 +51,10 @@ public class MultiLayerTransformer {
 
     private Matrix forwardLayers(Matrix X) {
         Matrix current = X;
-        for (int i = 0; i < numLayers; i++) current = layers[i].forward(current);
+        for (int i = 0; i < numLayers; i++) {
+            current = layers[i].forward(current);
+            current = feedforwards[i].forward(current);
+        }
         return current;
     }
 
@@ -72,6 +79,7 @@ public class MultiLayerTransformer {
         for (int k = 0; k < d; k++) dCurrent.set(T - 1, k, dh.get(k));
 
         for (int i = numLayers - 1; i >= 0; i--) {
+            dCurrent = feedforwards[i].backward(dCurrent, learningRate);
             dCurrent = layers[i].backward(dCurrent, learningRate);
         }
 
@@ -148,6 +156,6 @@ public class MultiLayerTransformer {
             if (model.predict(text.substring(i, i + T)) == text.charAt(i + T)) correct++;
             total++;
         }
-        System.out.println("Sanity check (2 stacked layers + positional encoding): " + correct + "/" + total);
+        System.out.println("Sanity check (2 layers + feedforward): " + correct + "/" + total);
     }
 }
