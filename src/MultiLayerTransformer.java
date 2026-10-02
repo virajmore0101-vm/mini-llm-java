@@ -5,6 +5,8 @@ public class MultiLayerTransformer {
     Matrix embeddingTable;
     AttentionLayer[] layers;
     FeedForward[] feedforwards;
+    LayerNorm[] attnNorms;
+    LayerNorm[] ffNorms;
     Matrix Wout;
     double learningRate;
     Map<Character, Integer> charToIndex = new HashMap<>();
@@ -27,9 +29,13 @@ public class MultiLayerTransformer {
         embeddingTable = AttentionLayer.randomMatrix(vocabSize, d, rand, 0.5);
         layers = new AttentionLayer[numLayers];
         feedforwards = new FeedForward[numLayers];
+        attnNorms = new LayerNorm[numLayers];
+        ffNorms = new LayerNorm[numLayers];
         for (int i = 0; i < numLayers; i++) {
             layers[i] = new AttentionLayer(d, rand);
             feedforwards[i] = new FeedForward(d, d * 4, rand);
+            attnNorms[i] = new LayerNorm(d);
+            ffNorms[i] = new LayerNorm(d);
         }
         Wout = AttentionLayer.randomMatrix(d, vocabSize, rand, 0.5);
     }
@@ -53,7 +59,9 @@ public class MultiLayerTransformer {
         Matrix current = X;
         for (int i = 0; i < numLayers; i++) {
             current = layers[i].forward(current);
+            current = attnNorms[i].forward(current);
             current = feedforwards[i].forward(current);
+            current = ffNorms[i].forward(current);
         }
         return current;
     }
@@ -79,7 +87,9 @@ public class MultiLayerTransformer {
         for (int k = 0; k < d; k++) dCurrent.set(T - 1, k, dh.get(k));
 
         for (int i = numLayers - 1; i >= 0; i--) {
+            dCurrent = ffNorms[i].backward(dCurrent, learningRate);
             dCurrent = feedforwards[i].backward(dCurrent, learningRate);
+            dCurrent = attnNorms[i].backward(dCurrent, learningRate);
             dCurrent = layers[i].backward(dCurrent, learningRate);
         }
 
@@ -156,6 +166,6 @@ public class MultiLayerTransformer {
             if (model.predict(text.substring(i, i + T)) == text.charAt(i + T)) correct++;
             total++;
         }
-        System.out.println("Sanity check (2 layers + feedforward): " + correct + "/" + total);
+        System.out.println("Sanity check (2 layers + feedforward + layer norm): " + correct + "/" + total);
     }
 }
