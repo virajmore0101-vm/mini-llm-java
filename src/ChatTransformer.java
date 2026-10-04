@@ -9,8 +9,8 @@ public class ChatTransformer {
         String text = Files.readString(Paths.get("shakespeare.txt")).substring(0, 2000);
         int T = 8;
 
-        System.out.println("Training the 2-layer transformer on " + text.length() + " characters... (about 20 seconds)");
-        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 16, 2, 0.02);
+        System.out.println("Training the transformer (2 layers, 4 heads each) on " + text.length() + " characters... (about 30 seconds)");
+        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 16, 2, 4, 0.005);
         for (int epoch = 0; epoch < 150; epoch++) {
             for (int i = 0; i + T < text.length(); i++) {
                 model.trainStep(text.substring(i, i + T), text.charAt(i + T));
