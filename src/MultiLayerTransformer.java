@@ -1,7 +1,7 @@
 import java.util.*;
 
 public class MultiLayerTransformer {
-    int vocabSize, d, contextLength, numLayers;
+    int vocabSize, d, contextLength, numLayers, numHeads;
     Matrix embeddingTable;
     AttentionLayer[] layers;
     FeedForward[] feedforwards;
@@ -12,10 +12,11 @@ public class MultiLayerTransformer {
     Map<Character, Integer> charToIndex = new HashMap<>();
     char[] indexToChar;
 
-    public MultiLayerTransformer(String text, int contextLength, int d, int numLayers, double learningRate) {
+    public MultiLayerTransformer(String text, int contextLength, int d, int numLayers, int numHeads, double learningRate) {
         this.contextLength = contextLength;
         this.d = d;
         this.numLayers = numLayers;
+        this.numHeads = numHeads;
         this.learningRate = learningRate;
 
         Set<Character> unique = new TreeSet<>();
@@ -32,7 +33,7 @@ public class MultiLayerTransformer {
         attnNorms = new LayerNorm[numLayers];
         ffNorms = new LayerNorm[numLayers];
         for (int i = 0; i < numLayers; i++) {
-            layers[i] = new AttentionLayer(d, rand);
+            layers[i] = new AttentionLayer(d, numHeads, rand);
             feedforwards[i] = new FeedForward(d, d * 4, rand);
             attnNorms[i] = new LayerNorm(d);
             ffNorms[i] = new LayerNorm(d);
@@ -152,7 +153,7 @@ public class MultiLayerTransformer {
     public static void main(String[] args) {
         String text = "abcabcabcabcabcabcabcabcabcabc";
         int T = 3;
-        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 8, 2, 0.05);
+        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 8, 2, 2, 0.05);
 
         int epochs = 400;
         for (int epoch = 0; epoch < epochs; epoch++) {
@@ -166,6 +167,6 @@ public class MultiLayerTransformer {
             if (model.predict(text.substring(i, i + T)) == text.charAt(i + T)) correct++;
             total++;
         }
-        System.out.println("Sanity check (2 layers + feedforward + layer norm): " + correct + "/" + total);
+        System.out.println("Sanity check (2 layers, 2 heads each): " + correct + "/" + total);
     }
 }

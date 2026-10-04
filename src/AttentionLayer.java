@@ -1,60 +1,125 @@
 import java.util.*;
 
 public class AttentionLayer {
-    Matrix Wq, Wk, Wv;
-    int d;
-    private Matrix X, Q, K, V, attnWeights;
+    int d, numHeads, headDim;
+    Matrix[] Wq, Wk, Wv;
+    Matrix Wo;
 
-    public AttentionLayer(int d, Random rand) {
+    private Matrix X;
+    private Matrix[] Q, K, V, attnWeights;
+    private Matrix concatOutput;
+
+    public AttentionLayer(int d, int numHeads, Random rand) {
         this.d = d;
-        Wq = randomMatrix(d, d, rand, 0.5);
-        Wk = randomMatrix(d, d, rand, 0.5);
-        Wv = randomMatrix(d, d, rand, 0.5);
+        this.numHeads = numHeads;
+        this.headDim = d / numHeads;
+        Wq = new Matrix[numHeads];
+        Wk = new Matrix[numHeads];
+        Wv = new Matrix[numHeads];
+        for (int h = 0; h < numHeads; h++) {
+            Wq[h] = randomMatrix(d, headDim, rand, 0.5);
+            Wk[h] = randomMatrix(d, headDim, rand, 0.5);
+            Wv[h] = randomMatrix(d, headDim, rand, 0.5);
+        }
+        Wo = randomMatrix(d, d, rand, 0.5);
     }
 
     public Matrix forward(Matrix X) {
         this.X = X;
-        Q = X.multiply(Wq);
-        K = X.multiply(Wk);
-        V = X.multiply(Wv);
-        Matrix scores = Q.multiply(K.transpose()).scale(1.0 / Math.sqrt(d));
-        attnWeights = softmaxRows(scores);
-        Matrix attnOutput = attnWeights.multiply(V);
+        int T = X.rows();
+        Q = new Matrix[numHeads];
+        K = new Matrix[numHeads];
+        V = new Matrix[numHeads];
+        attnWeights = new Matrix[numHeads];
+        Matrix[] headOutputs = new Matrix[numHeads];
+
+        for (int h = 0; h < numHeads; h++) {
+            Q[h] = X.multiply(Wq[h]);
+            K[h] = X.multiply(Wk[h]);
+            V[h] = X.multiply(Wv[h]);
+            Matrix scores = Q[h].multiply(K[h].transpose()).scale(1.0 / Math.sqrt(headDim));
+            attnWeights[h] = softmaxRows(scores);
+            headOutputs[h] = attnWeights[h].multiply(V[h]);
+        }
+
+        concatOutput = concat(headOutputs, T);
+        Matrix attnOutput = concatOutput.multiply(Wo);
         return X.add(attnOutput);
     }
 
     public Matrix backward(Matrix dLayerOutput, double learningRate) {
         int T = X.rows();
 
-        Matrix dV = attnWeights.transpose().multiply(dLayerOutput);
-        Matrix dAttnWeights = dLayerOutput.multiply(V.transpose());
+        Matrix dConcatOutput = dLayerOutput.multiply(Wo.transpose());
+        Matrix dWo = concatOutput.transpose().multiply(dLayerOutput);
 
-        Matrix dScores = new Matrix(T, T);
-        for (int i = 0; i < T; i++) {
-            double dot = 0;
-            for (int j = 0; j < T; j++) dot += attnWeights.get(i, j) * dAttnWeights.get(i, j);
-            for (int j = 0; j < T; j++) {
-                dScores.set(i, j, attnWeights.get(i, j) * (dAttnWeights.get(i, j) - dot) / Math.sqrt(d));
+        Matrix[] dHeadOutputs = splitByHead(dConcatOutput, T);
+        Matrix dX = dLayerOutput;
+
+        Matrix[] dWqArr = new Matrix[numHeads];
+        Matrix[] dWkArr = new Matrix[numHeads];
+        Matrix[] dWvArr = new Matrix[numHeads];
+
+        for (int h = 0; h < numHeads; h++) {
+            Matrix dV_h = attnWeights[h].transpose().multiply(dHeadOutputs[h]);
+            Matrix dAttnWeights_h = dHeadOutputs[h].multiply(V[h].transpose());
+
+            Matrix dScores_h = new Matrix(T, T);
+            for (int i = 0; i < T; i++) {
+                double dot = 0;
+                for (int j = 0; j < T; j++) dot += attnWeights[h].get(i, j) * dAttnWeights_h.get(i, j);
+                for (int j = 0; j < T; j++) {
+                    dScores_h.set(i, j, attnWeights[h].get(i, j) * (dAttnWeights_h.get(i, j) - dot) / Math.sqrt(headDim));
+                }
             }
+
+            Matrix dQ_h = dScores_h.multiply(K[h]);
+            Matrix dK_h = dScores_h.transpose().multiply(Q[h]);
+
+            dWqArr[h] = X.transpose().multiply(dQ_h);
+            dWkArr[h] = X.transpose().multiply(dK_h);
+            dWvArr[h] = X.transpose().multiply(dV_h);
+
+            Matrix dX_fromHead = dQ_h.multiply(Wq[h].transpose())
+                .add(dK_h.multiply(Wk[h].transpose()))
+                .add(dV_h.multiply(Wv[h].transpose()));
+
+            dX = dX.add(dX_fromHead);
         }
 
-        Matrix dQ = dScores.multiply(K);
-        Matrix dK = dScores.transpose().multiply(Q);
-
-        Matrix dWq = X.transpose().multiply(dQ);
-        Matrix dWk = X.transpose().multiply(dK);
-        Matrix dWv = X.transpose().multiply(dV);
-
-        Matrix dX = dLayerOutput
-            .add(dQ.multiply(Wq.transpose()))
-            .add(dK.multiply(Wk.transpose()))
-            .add(dV.multiply(Wv.transpose()));
-
-        Wq = Wq.add(dWq.scale(-learningRate));
-        Wk = Wk.add(dWk.scale(-learningRate));
-        Wv = Wv.add(dWv.scale(-learningRate));
+        for (int h = 0; h < numHeads; h++) {
+            Wq[h] = Wq[h].add(dWqArr[h].scale(-learningRate));
+            Wk[h] = Wk[h].add(dWkArr[h].scale(-learningRate));
+            Wv[h] = Wv[h].add(dWvArr[h].scale(-learningRate));
+        }
+        Wo = Wo.add(dWo.scale(-learningRate));
 
         return dX;
+    }
+
+    private Matrix concat(Matrix[] heads, int T) {
+        Matrix result = new Matrix(T, d);
+        for (int h = 0; h < numHeads; h++) {
+            for (int i = 0; i < T; i++) {
+                for (int j = 0; j < headDim; j++) {
+                    result.set(i, h * headDim + j, heads[h].get(i, j));
+                }
+            }
+        }
+        return result;
+    }
+
+    private Matrix[] splitByHead(Matrix full, int T) {
+        Matrix[] result = new Matrix[numHeads];
+        for (int h = 0; h < numHeads; h++) {
+            result[h] = new Matrix(T, headDim);
+            for (int i = 0; i < T; i++) {
+                for (int j = 0; j < headDim; j++) {
+                    result[h].set(i, j, full.get(i, h * headDim + j));
+                }
+            }
+        }
+        return result;
     }
 
     static Matrix softmaxRows(Matrix scores) {
