@@ -6,14 +6,19 @@ import java.util.Scanner;
 
 public class ChatTransformer {
     public static void main(String[] args) throws IOException {
-        String text = Files.readString(Paths.get("shakespeare.txt")).substring(0, 2000);
-        int T = 8;
+        String text = Files.readString(Paths.get("shakespeare.txt")).substring(0, 3000);
+        int T = 10;
 
-        System.out.println("Training the transformer (2 layers, 4 heads each) on " + text.length() + " characters... (about 30 seconds)");
-        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 16, 2, 4, 0.005);
-        for (int epoch = 0; epoch < 150; epoch++) {
+        System.out.println("Training the scaled-up transformer (3 layers, 4 heads, 24-dim) on "
+            + text.length() + " characters... this takes about 4-5 minutes, not a hang.");
+        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 24, 3, 4, 0.004);
+        long start = System.currentTimeMillis();
+        for (int epoch = 0; epoch < 100; epoch++) {
             for (int i = 0; i + T < text.length(); i++) {
                 model.trainStep(text.substring(i, i + T), text.charAt(i + T));
+            }
+            if (epoch % 20 == 0) {
+                System.out.println("  ...epoch " + epoch + " (" + (System.currentTimeMillis() - start) / 1000 + "s elapsed)");
             }
         }
         System.out.println("Ready. Type something and press enter (or 'exit' to quit):\n");
@@ -31,7 +36,7 @@ public class ChatTransformer {
 
             String seed = findSeed(model, text, input, T, rand);
             StringBuilder out = new StringBuilder(seed);
-            for (int i = 0; i < 150; i++) {
+            for (int i = 0; i < 200; i++) {
                 out.append(model.sampleNext(out.substring(out.length() - T), rand));
             }
             System.out.println("\nModel: " + out + "\n");
