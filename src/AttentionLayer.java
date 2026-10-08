@@ -37,7 +37,7 @@ public class AttentionLayer {
             Q[h] = X.multiply(Wq[h]);
             K[h] = X.multiply(Wk[h]);
             V[h] = X.multiply(Wv[h]);
-            Matrix scores = Q[h].multiply(K[h].transpose()).scale(1.0 / Math.sqrt(headDim));
+            Matrix scores = Q[h].multiplyByTranspose(K[h]).scale(1.0 / Math.sqrt(headDim));
             attnWeights[h] = softmaxRows(scores);
             headOutputs[h] = attnWeights[h].multiply(V[h]);
         }
@@ -50,8 +50,8 @@ public class AttentionLayer {
     public Matrix backward(Matrix dLayerOutput, double learningRate) {
         int T = X.rows();
 
-        Matrix dConcatOutput = dLayerOutput.multiply(Wo.transpose());
-        Matrix dWo = concatOutput.transpose().multiply(dLayerOutput);
+        Matrix dConcatOutput = dLayerOutput.multiplyByTranspose(Wo);
+        Matrix dWo = concatOutput.transposeMultiply(dLayerOutput);
 
         Matrix[] dHeadOutputs = splitByHead(dConcatOutput, T);
         Matrix dX = dLayerOutput;
@@ -61,8 +61,8 @@ public class AttentionLayer {
         Matrix[] dWvArr = new Matrix[numHeads];
 
         for (int h = 0; h < numHeads; h++) {
-            Matrix dV_h = attnWeights[h].transpose().multiply(dHeadOutputs[h]);
-            Matrix dAttnWeights_h = dHeadOutputs[h].multiply(V[h].transpose());
+            Matrix dV_h = attnWeights[h].transposeMultiply(dHeadOutputs[h]);
+            Matrix dAttnWeights_h = dHeadOutputs[h].multiplyByTranspose(V[h]);
 
             Matrix dScores_h = new Matrix(T, T);
             for (int i = 0; i < T; i++) {
@@ -74,15 +74,15 @@ public class AttentionLayer {
             }
 
             Matrix dQ_h = dScores_h.multiply(K[h]);
-            Matrix dK_h = dScores_h.transpose().multiply(Q[h]);
+            Matrix dK_h = dScores_h.transposeMultiply(Q[h]);
 
-            dWqArr[h] = X.transpose().multiply(dQ_h);
-            dWkArr[h] = X.transpose().multiply(dK_h);
-            dWvArr[h] = X.transpose().multiply(dV_h);
+            dWqArr[h] = X.transposeMultiply(dQ_h);
+            dWkArr[h] = X.transposeMultiply(dK_h);
+            dWvArr[h] = X.transposeMultiply(dV_h);
 
-            Matrix dX_fromHead = dQ_h.multiply(Wq[h].transpose())
-                .add(dK_h.multiply(Wk[h].transpose()))
-                .add(dV_h.multiply(Wv[h].transpose()));
+            Matrix dX_fromHead = dQ_h.multiplyByTranspose(Wq[h])
+                .add(dK_h.multiplyByTranspose(Wk[h]))
+                .add(dV_h.multiplyByTranspose(Wv[h]));
 
             dX = dX.add(dX_fromHead);
         }

@@ -26,12 +26,12 @@ public class FeedForward {
     public Matrix backward(Matrix dLayerOutput, double learningRate) {
         Matrix dFFOutput = dLayerOutput;
 
-        Matrix dHidden = dFFOutput.multiply(W2.transpose());
-        Matrix dW2 = hidden.transpose().multiply(dFFOutput);
+        Matrix dHidden = dFFOutput.multiplyByTranspose(W2);
+        Matrix dW2 = hidden.transposeMultiply(dFFOutput);
 
         Matrix dPreActivation = reluBackward(dHidden, preActivation);
-        Matrix dW1 = X.transpose().multiply(dPreActivation);
-        Matrix dX_fromFF = dPreActivation.multiply(W1.transpose());
+        Matrix dW1 = X.transposeMultiply(dPreActivation);
+        Matrix dX_fromFF = dPreActivation.multiplyByTranspose(W1);
 
         Matrix dX = dLayerOutput.add(dX_fromFF);
 
