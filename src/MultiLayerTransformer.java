@@ -104,6 +104,33 @@ public class MultiLayerTransformer {
         return loss;
     }
 
+    /** Forward pass only: how surprised is the model by the true next character? Lower is better. */
+    public double loss(String context, char actualNext) {
+        Matrix finalOutput = forwardLayers(embed(context));
+        Vector h = getRow(finalOutput, contextLength - 1);
+        double[] probs = softmax(vectorToArray(Wout.transpose().multiply(h)));
+        return -Math.log(probs[charToIndex.get(actualNext)] + 1e-9);
+    }
+
+    /** Average loss on text the model was NOT trained on (skips windows with characters it has never seen). */
+    public double evaluate(String text, int maxWindows) {
+        int T = contextLength;
+        int total = text.length() - T;
+        int stride = Math.max(1, total / maxWindows);
+        double sum = 0;
+        int n = 0;
+        for (int i = 0; i < total; i += stride) {
+            String ctx = text.substring(i, i + T);
+            char next = text.charAt(i + T);
+            boolean known = charToIndex.containsKey(next);
+            for (int j = 0; j < T && known; j++) known = charToIndex.containsKey(ctx.charAt(j));
+            if (!known) continue;
+            sum += loss(ctx, next);
+            n++;
+        }
+        return n == 0 ? Double.NaN : sum / n;
+    }
+
     public char predict(String context) {
         Matrix finalOutput = forwardLayers(embed(context));
         Vector h = getRow(finalOutput, contextLength - 1);
@@ -114,9 +141,16 @@ public class MultiLayerTransformer {
     }
 
     public char sampleNext(String context, Random rand) {
+        return sampleNext(context, rand, 1.0);
+    }
+
+    /** Temperature below 1.0 plays it safer (more coherent, less varied); above 1.0 gets wilder. */
+    public char sampleNext(String context, Random rand, double temperature) {
         Matrix finalOutput = forwardLayers(embed(context));
         Vector h = getRow(finalOutput, contextLength - 1);
-        double[] probs = softmax(vectorToArray(Wout.transpose().multiply(h)));
+        double[] logits = vectorToArray(Wout.transpose().multiply(h));
+        for (int i = 0; i < logits.length; i++) logits[i] /= temperature;
+        double[] probs = softmax(logits);
         double r = rand.nextDouble();
         double cumulative = 0;
         for (int i = 0; i < probs.length; i++) {
