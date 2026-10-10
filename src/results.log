@@ -1,0 +1,1 @@
+2026-10-10 23:45 | context=32 dim=24 layers=3 heads=4 lr=0.001 | 420s 414,848 steps | best val 1.619 @420s | final val 1.619 | train-eval 1.423 | real words 83% | copied 1%

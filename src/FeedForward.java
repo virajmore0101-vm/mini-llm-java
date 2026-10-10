@@ -8,11 +8,14 @@ import java.util.*;
  */
 public class FeedForward {
     Matrix W1, W2;
+    private Adam adam1, adam2;
     private Matrix X, preActivation, hidden;
 
     public FeedForward(int d, int hiddenSize, Random rand) {
         W1 = AttentionLayer.randomMatrix(d, hiddenSize, rand, 0.3);
         W2 = AttentionLayer.randomMatrix(hiddenSize, d, rand, 0.3);
+        adam1 = new Adam(d * hiddenSize);
+        adam2 = new Adam(hiddenSize * d);
     }
 
     public Matrix forward(Matrix X) {
@@ -35,8 +38,8 @@ public class FeedForward {
 
         Matrix dX = dLayerOutput.add(dX_fromFF);
 
-        W1 = W1.add(dW1.scale(-learningRate));
-        W2 = W2.add(dW2.scale(-learningRate));
+        W1 = adam1.step(W1, dW1, learningRate);
+        W2 = adam2.step(W2, dW2, learningRate);
 
         return dX;
     }

@@ -1,6 +1,10 @@
+import java.io.*;
 import java.util.*;
 
 public class MultiLayerTransformer {
+    static final int EVAL_START = 64;   // validation always predicts characters at index >= 64, so every model sees the same targets
+    static final double EMBED_INIT = 0.5, OUT_INIT = 0.1;
+
     int vocabSize, d, contextLength, numLayers, numHeads;
     Matrix embeddingTable;
     AttentionLayer[] layers;
@@ -8,10 +12,12 @@ public class MultiLayerTransformer {
     LayerNorm[] attnNorms;
     LayerNorm[] ffNorms;
     Matrix Wout;
+    Adam adamOut, adamEmb;
     double learningRate;
     Map<Character, Integer> charToIndex = new HashMap<>();
     char[] indexToChar;
 
+    /** The vocabulary is every distinct character in `text` (pass the saved vocabulary string when loading a checkpoint). */
     public MultiLayerTransformer(String text, int contextLength, int d, int numLayers, int numHeads, double learningRate) {
         this.contextLength = contextLength;
         this.d = d;
@@ -27,7 +33,7 @@ public class MultiLayerTransformer {
         for (char c : unique) { charToIndex.put(c, idx); indexToChar[idx] = c; idx++; }
 
         Random rand = new Random(7);
-        embeddingTable = AttentionLayer.randomMatrix(vocabSize, d, rand, 0.5);
+        embeddingTable = AttentionLayer.randomMatrix(vocabSize, d, rand, EMBED_INIT);
         layers = new AttentionLayer[numLayers];
         feedforwards = new FeedForward[numLayers];
         attnNorms = new LayerNorm[numLayers];
@@ -38,11 +44,13 @@ public class MultiLayerTransformer {
             attnNorms[i] = new LayerNorm(d);
             ffNorms[i] = new LayerNorm(d);
         }
-        Wout = AttentionLayer.randomMatrix(d, vocabSize, rand, 0.5);
+        Wout = AttentionLayer.randomMatrix(d, vocabSize, rand, OUT_INIT);
+        adamOut = new Adam(d * vocabSize);
+        adamEmb = new Adam(vocabSize * d);
     }
 
     private Matrix embed(String context) {
-        int T = contextLength;
+        int T = context.length();
         Matrix X = new Matrix(T, d);
         for (int i = 0; i < T; i++) {
             int ci = charToIndex.get(context.charAt(i));
@@ -67,25 +75,28 @@ public class MultiLayerTransformer {
         return current;
     }
 
-    public double trainStep(String context, char actualNext) {
-        int T = contextLength;
-        Matrix X = embed(context);
-        Matrix finalOutput = forwardLayers(X);
+    /** Hidden state of every position (used by GradCheck to prove position i never sees the future). */
+    Matrix hiddenStates(String context) { return forwardLayers(embed(context)); }
 
-        Vector h = getRow(finalOutput, T - 1);
-        Vector logits = Wout.transpose().multiply(h);
-        double[] probs = softmax(vectorToArray(logits));
-        int targetIdx = charToIndex.get(actualNext);
-        double loss = -Math.log(probs[targetIdx] + 1e-9);
+    /**
+     * One training step on a window of T+1 characters: the first T are the input, and at EVERY position i
+     * the model must predict character i+1. The loss is the average over the T positions.
+     */
+    public double trainSequence(String window) {
+        int n = window.length() - 1;
+        Matrix F = forwardLayers(embed(window.substring(0, n)));
+        Matrix logits = F.multiply(Wout);
 
-        double[] dLogits = probs.clone();
-        dLogits[targetIdx] -= 1.0;
-        Vector dLogitsVec = arrayToVector(dLogits);
-        Matrix dWout = Matrix.outerProduct(h, dLogitsVec);
-        Vector dh = Wout.multiply(dLogitsVec);
-
-        Matrix dCurrent = new Matrix(T, d);
-        for (int k = 0; k < d; k++) dCurrent.set(T - 1, k, dh.get(k));
+        Matrix dLogits = new Matrix(n, vocabSize);
+        double loss = 0;
+        for (int i = 0; i < n; i++) {
+            double[] probs = softmaxRow(logits, i);
+            int target = charToIndex.get(window.charAt(i + 1));
+            loss -= Math.log(probs[target] + 1e-9);
+            for (int v = 0; v < vocabSize; v++) dLogits.set(i, v, (probs[v] - (v == target ? 1.0 : 0.0)) / n);
+        }
+        Matrix dWout = F.transposeMultiply(dLogits);
+        Matrix dCurrent = dLogits.multiplyByTranspose(Wout);
 
         for (int i = numLayers - 1; i >= 0; i--) {
             dCurrent = ffNorms[i].backward(dCurrent, learningRate);
@@ -94,65 +105,75 @@ public class MultiLayerTransformer {
             dCurrent = layers[i].backward(dCurrent, learningRate);
         }
 
-        Wout = Wout.add(dWout.scale(-learningRate));
-        for (int i = 0; i < T; i++) {
-            int ci = charToIndex.get(context.charAt(i));
-            for (int k = 0; k < d; k++) {
-                embeddingTable.set(ci, k, embeddingTable.get(ci, k) - learningRate * dCurrent.get(i, k));
-            }
+        Wout = adamOut.step(Wout, dWout, learningRate);
+        Matrix dEmbedding = new Matrix(vocabSize, d);
+        for (int i = 0; i < n; i++) {
+            int ci = charToIndex.get(window.charAt(i));
+            for (int k = 0; k < d; k++) dEmbedding.set(ci, k, dEmbedding.get(ci, k) + dCurrent.get(i, k));
         }
-        return loss;
+        embeddingTable = adamEmb.step(embeddingTable, dEmbedding, learningRate);
+        return loss / n;
     }
 
-    /** Forward pass only: how surprised is the model by the true next character? Lower is better. */
-    public double loss(String context, char actualNext) {
-        Matrix finalOutput = forwardLayers(embed(context));
-        Vector h = getRow(finalOutput, contextLength - 1);
-        double[] probs = softmax(vectorToArray(Wout.transpose().multiply(h)));
-        return -Math.log(probs[charToIndex.get(actualNext)] + 1e-9);
+    /** Forward pass only, same average loss as trainSequence (used for gradient checking). */
+    public double sequenceLoss(String window) {
+        int n = window.length() - 1;
+        Matrix logits = forwardLayers(embed(window.substring(0, n))).multiply(Wout);
+        double loss = 0;
+        for (int i = 0; i < n; i++) loss -= Math.log(softmaxRow(logits, i)[charToIndex.get(window.charAt(i + 1))] + 1e-9);
+        return loss / n;
     }
 
-    /** Average loss on text the model was NOT trained on (skips windows with characters it has never seen). */
+    /** Scores for the next character after `context` (the last contextLength characters are used). */
+    private double[] nextLogits(String context) {
+        if (context.length() > contextLength) context = context.substring(context.length() - contextLength);
+        Matrix F = forwardLayers(embed(context));
+        int last = F.rows() - 1;
+        double[] logits = new double[vocabSize];
+        for (int v = 0; v < vocabSize; v++) {
+            double s = 0;
+            for (int k = 0; k < d; k++) s += F.get(last, k) * Wout.get(k, v);
+            logits[v] = s;
+        }
+        return logits;
+    }
+
+    /**
+     * Average loss when predicting the character at positions EVAL_START, EVAL_START+stride, ... of `text`,
+     * given the previous contextLength characters. Lower is better; pure guessing is ln(vocabSize).
+     * Skips targets whose characters the model has never seen.
+     */
     public double evaluate(String text, int maxWindows) {
         int T = contextLength;
-        int total = text.length() - T;
-        int stride = Math.max(1, total / maxWindows);
+        int start = Math.max(EVAL_START, T);
+        int stride = Math.max(1, (text.length() - start) / maxWindows);
         double sum = 0;
         int n = 0;
-        for (int i = 0; i < total; i += stride) {
-            String ctx = text.substring(i, i + T);
-            char next = text.charAt(i + T);
+        for (int p = start; p < text.length(); p += stride) {
+            String ctx = text.substring(p - T, p);
+            char next = text.charAt(p);
             boolean known = charToIndex.containsKey(next);
             for (int j = 0; j < T && known; j++) known = charToIndex.containsKey(ctx.charAt(j));
             if (!known) continue;
-            sum += loss(ctx, next);
+            sum -= Math.log(softmax(nextLogits(ctx))[charToIndex.get(next)] + 1e-9);
             n++;
         }
         return n == 0 ? Double.NaN : sum / n;
     }
 
     public char predict(String context) {
-        Matrix finalOutput = forwardLayers(embed(context));
-        Vector h = getRow(finalOutput, contextLength - 1);
-        double[] probs = softmax(vectorToArray(Wout.transpose().multiply(h)));
+        double[] logits = nextLogits(context);
         int best = 0;
-        for (int i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
+        for (int i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
         return indexToChar[best];
-    }
-
-    public char sampleNext(String context, Random rand) {
-        return sampleNext(context, rand, 1.0);
     }
 
     /** Temperature below 1.0 plays it safer (more coherent, less varied); above 1.0 gets wilder. */
     public char sampleNext(String context, Random rand, double temperature) {
-        Matrix finalOutput = forwardLayers(embed(context));
-        Vector h = getRow(finalOutput, contextLength - 1);
-        double[] logits = vectorToArray(Wout.transpose().multiply(h));
+        double[] logits = nextLogits(context);
         for (int i = 0; i < logits.length; i++) logits[i] /= temperature;
         double[] probs = softmax(logits);
-        double r = rand.nextDouble();
-        double cumulative = 0;
+        double r = rand.nextDouble(), cumulative = 0;
         for (int i = 0; i < probs.length; i++) {
             cumulative += probs[i];
             if (r < cumulative) return indexToChar[i];
@@ -160,20 +181,54 @@ public class MultiLayerTransformer {
         return indexToChar[probs.length - 1];
     }
 
-    private static Vector getRow(Matrix m, int row) {
-        Vector v = new Vector(m.cols());
-        for (int c = 0; c < m.cols(); c++) v.set(c, m.get(row, c));
-        return v;
+    // ---------- saving and loading (weights only; Adam's memory is not saved) ----------
+    public void save(String path) throws IOException {
+        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(path)))) {
+            out.writeInt(contextLength); out.writeInt(d); out.writeInt(numLayers); out.writeInt(numHeads);
+            out.writeUTF(new String(indexToChar));
+            writeMatrix(out, embeddingTable); writeMatrix(out, Wout);
+            for (int l = 0; l < numLayers; l++) {
+                for (int h = 0; h < numHeads; h++) {
+                    writeMatrix(out, layers[l].Wq[h]); writeMatrix(out, layers[l].Wk[h]); writeMatrix(out, layers[l].Wv[h]);
+                }
+                writeMatrix(out, layers[l].Wo); writeMatrix(out, feedforwards[l].W1); writeMatrix(out, feedforwards[l].W2);
+                for (LayerNorm ln : new LayerNorm[] { attnNorms[l], ffNorms[l] }) { writeArray(out, ln.gamma); writeArray(out, ln.beta); }
+            }
+        }
     }
-    private static double[] vectorToArray(Vector v) {
-        double[] a = new double[v.size()];
-        for (int i = 0; i < v.size(); i++) a[i] = v.get(i);
-        return a;
+
+    public static MultiLayerTransformer load(String path) throws IOException {
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(path)))) {
+            int T = in.readInt(), d = in.readInt(), layers = in.readInt(), heads = in.readInt();
+            MultiLayerTransformer m = new MultiLayerTransformer(in.readUTF(), T, d, layers, heads, 0.0);
+            m.embeddingTable = readMatrix(in); m.Wout = readMatrix(in);
+            for (int l = 0; l < layers; l++) {
+                for (int h = 0; h < heads; h++) {
+                    m.layers[l].Wq[h] = readMatrix(in); m.layers[l].Wk[h] = readMatrix(in); m.layers[l].Wv[h] = readMatrix(in);
+                }
+                m.layers[l].Wo = readMatrix(in); m.feedforwards[l].W1 = readMatrix(in); m.feedforwards[l].W2 = readMatrix(in);
+                for (LayerNorm ln : new LayerNorm[] { m.attnNorms[l], m.ffNorms[l] }) { readArray(in, ln.gamma); readArray(in, ln.beta); }
+            }
+            return m;
+        }
     }
-    private static Vector arrayToVector(double[] a) {
-        Vector v = new Vector(a.length);
-        for (int i = 0; i < a.length; i++) v.set(i, a[i]);
-        return v;
+
+    private static void writeMatrix(DataOutputStream out, Matrix m) throws IOException {
+        out.writeInt(m.rows()); out.writeInt(m.cols());
+        for (int r = 0; r < m.rows(); r++) for (int c = 0; c < m.cols(); c++) out.writeDouble(m.get(r, c));
+    }
+    private static Matrix readMatrix(DataInputStream in) throws IOException {
+        Matrix m = new Matrix(in.readInt(), in.readInt());
+        for (int r = 0; r < m.rows(); r++) for (int c = 0; c < m.cols(); c++) m.set(r, c, in.readDouble());
+        return m;
+    }
+    private static void writeArray(DataOutputStream out, double[] a) throws IOException { for (double x : a) out.writeDouble(x); }
+    private static void readArray(DataInputStream in, double[] a) throws IOException { for (int i = 0; i < a.length; i++) a[i] = in.readDouble(); }
+
+    private static double[] softmaxRow(Matrix m, int row) {
+        double[] a = new double[m.cols()];
+        for (int c = 0; c < a.length; c++) a[c] = m.get(row, c);
+        return softmax(a);
     }
     private static double[] softmax(double[] scores) {
         double max = Arrays.stream(scores).max().getAsDouble();
@@ -187,15 +242,10 @@ public class MultiLayerTransformer {
     public static void main(String[] args) {
         String text = "abcabcabcabcabcabcabcabcabcabc";
         int T = 3;
-        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 8, 2, 2, 0.05);
-
-        int epochs = 400;
-        for (int epoch = 0; epoch < epochs; epoch++) {
-            for (int i = 0; i + T < text.length(); i++) {
-                model.trainStep(text.substring(i, i + T), text.charAt(i + T));
-            }
+        MultiLayerTransformer model = new MultiLayerTransformer(text, T, 8, 2, 2, 0.01);
+        for (int epoch = 0; epoch < 400; epoch++) {
+            for (int i = 0; i + T < text.length(); i++) model.trainSequence(text.substring(i, i + T + 1));
         }
-
         int correct = 0, total = 0;
         for (int i = 0; i + T < text.length(); i++) {
             if (model.predict(text.substring(i, i + T)) == text.charAt(i + T)) correct++;

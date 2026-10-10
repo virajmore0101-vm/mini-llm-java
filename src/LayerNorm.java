@@ -1,5 +1,6 @@
 public class LayerNorm {
     double[] gamma, beta;
+    private Adam adamGamma, adamBeta;
     private Matrix X;
     private Matrix normalized;
     private double[] mean, variance;
@@ -9,6 +10,8 @@ public class LayerNorm {
         gamma = new double[d];
         beta = new double[d];
         for (int j = 0; j < d; j++) { gamma[j] = 1.0; beta[j] = 0.0; }
+        adamGamma = new Adam(d);
+        adamBeta = new Adam(d);
     }
 
     public Matrix forward(Matrix X) {
@@ -63,10 +66,8 @@ public class LayerNorm {
             }
         }
 
-        for (int j = 0; j < d; j++) {
-            gamma[j] -= learningRate * dGamma[j];
-            beta[j] -= learningRate * dBeta[j];
-        }
+        adamGamma.step(gamma, dGamma, learningRate);
+        adamBeta.step(beta, dBeta, learningRate);
 
         return dX;
     }

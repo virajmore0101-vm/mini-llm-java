@@ -4,6 +4,8 @@ public class AttentionLayer {
     int d, numHeads, headDim;
     Matrix[] Wq, Wk, Wv;
     Matrix Wo;
+    Adam[] adamQ, adamK, adamV;
+    Adam adamO;
 
     private Matrix X;
     private Matrix[] Q, K, V, attnWeights;
@@ -22,6 +24,15 @@ public class AttentionLayer {
             Wv[h] = randomMatrix(d, headDim, rand, 0.5);
         }
         Wo = randomMatrix(d, d, rand, 0.5);
+        adamQ = new Adam[numHeads];
+        adamK = new Adam[numHeads];
+        adamV = new Adam[numHeads];
+        for (int h = 0; h < numHeads; h++) {
+            adamQ[h] = new Adam(d * headDim);
+            adamK[h] = new Adam(d * headDim);
+            adamV[h] = new Adam(d * headDim);
+        }
+        adamO = new Adam(d * d);
     }
 
     public Matrix forward(Matrix X) {
@@ -38,6 +49,8 @@ public class AttentionLayer {
             K[h] = X.multiply(Wk[h]);
             V[h] = X.multiply(Wv[h]);
             Matrix scores = Q[h].multiplyByTranspose(K[h]).scale(1.0 / Math.sqrt(headDim));
+            // Causal mask: position i may only look at positions 0..i (never at the future).
+            for (int i = 0; i < T; i++) for (int j = i + 1; j < T; j++) scores.set(i, j, Double.NEGATIVE_INFINITY);
             attnWeights[h] = softmaxRows(scores);
             headOutputs[h] = attnWeights[h].multiply(V[h]);
         }
@@ -88,11 +101,11 @@ public class AttentionLayer {
         }
 
         for (int h = 0; h < numHeads; h++) {
-            Wq[h] = Wq[h].add(dWqArr[h].scale(-learningRate));
-            Wk[h] = Wk[h].add(dWkArr[h].scale(-learningRate));
-            Wv[h] = Wv[h].add(dWvArr[h].scale(-learningRate));
+            Wq[h] = adamQ[h].step(Wq[h], dWqArr[h], learningRate);
+            Wk[h] = adamK[h].step(Wk[h], dWkArr[h], learningRate);
+            Wv[h] = adamV[h].step(Wv[h], dWvArr[h], learningRate);
         }
-        Wo = Wo.add(dWo.scale(-learningRate));
+        Wo = adamO.step(Wo, dWo, learningRate);
 
         return dX;
     }
