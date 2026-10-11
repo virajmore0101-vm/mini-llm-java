@@ -1,6 +1,8 @@
+import java.util.List;
+
 public class LayerNorm {
     double[] gamma, beta;
-    private Adam adamGamma, adamBeta;
+    Param pGamma, pBeta;
     private Matrix X;
     private Matrix normalized;
     private double[] mean, variance;
@@ -10,9 +12,19 @@ public class LayerNorm {
         gamma = new double[d];
         beta = new double[d];
         for (int j = 0; j < d; j++) { gamma[j] = 1.0; beta[j] = 0.0; }
-        adamGamma = new Adam(d);
-        adamBeta = new Adam(d);
+        pGamma = new Param(new double[][] { gamma });   // a one-row view of the same numbers, updated in place
+        pBeta = new Param(new double[][] { beta });
     }
+
+    /** A helper that shares gamma and beta with `master` but has its own memory of the last forward pass and its own gradients. */
+    LayerNorm(LayerNorm master) {
+        gamma = master.gamma;
+        beta = master.beta;
+        pGamma = new Param(new double[][] { gamma });
+        pBeta = new Param(new double[][] { beta });
+    }
+
+    void collect(List<Param> out) { out.add(pGamma); out.add(pBeta); }
 
     public Matrix forward(Matrix X) {
         this.X = X;
@@ -41,7 +53,8 @@ public class LayerNorm {
         return output;
     }
 
-    public Matrix backward(Matrix dOut, double learningRate) {
+    /** Returns the gradient for the input and ADDS the gradients of gamma and beta to their Params (no weight update here). */
+    public Matrix backward(Matrix dOut) {
         int T = X.rows(), d = X.cols();
         Matrix dX = new Matrix(T, d);
         double[] dGamma = new double[d];
@@ -66,9 +79,8 @@ public class LayerNorm {
             }
         }
 
-        adamGamma.step(gamma, dGamma, learningRate);
-        adamBeta.step(beta, dBeta, learningRate);
-
+        pGamma.addGrad(dGamma);
+        pBeta.addGrad(dBeta);
         return dX;
     }
 }

@@ -4,8 +4,8 @@ public class AttentionLayer {
     int d, numHeads, headDim;
     Matrix[] Wq, Wk, Wv;
     Matrix Wo;
-    Adam[] adamQ, adamK, adamV;
-    Adam adamO;
+    Param[] pQ, pK, pV;
+    Param pO;
 
     private Matrix X;
     private Matrix[] Q, K, V, attnWeights;
@@ -24,15 +24,41 @@ public class AttentionLayer {
             Wv[h] = randomMatrix(d, headDim, rand, 0.5);
         }
         Wo = randomMatrix(d, d, rand, 0.5);
-        adamQ = new Adam[numHeads];
-        adamK = new Adam[numHeads];
-        adamV = new Adam[numHeads];
+        makeParams();
+    }
+
+    /** A helper that shares the weights of `master` but has its own memory of the last forward pass and its own gradients. */
+    AttentionLayer(AttentionLayer master) {
+        d = master.d;
+        numHeads = master.numHeads;
+        headDim = master.headDim;
+        Wq = new Matrix[numHeads];
+        Wk = new Matrix[numHeads];
+        Wv = new Matrix[numHeads];
         for (int h = 0; h < numHeads; h++) {
-            adamQ[h] = new Adam(d * headDim);
-            adamK[h] = new Adam(d * headDim);
-            adamV[h] = new Adam(d * headDim);
+            Wq[h] = new Matrix(master.Wq[h].raw());
+            Wk[h] = new Matrix(master.Wk[h].raw());
+            Wv[h] = new Matrix(master.Wv[h].raw());
         }
-        adamO = new Adam(d * d);
+        Wo = new Matrix(master.Wo.raw());
+        makeParams();
+    }
+
+    private void makeParams() {
+        pQ = new Param[numHeads];
+        pK = new Param[numHeads];
+        pV = new Param[numHeads];
+        for (int h = 0; h < numHeads; h++) {
+            pQ[h] = new Param(Wq[h]);
+            pK[h] = new Param(Wk[h]);
+            pV[h] = new Param(Wv[h]);
+        }
+        pO = new Param(Wo);
+    }
+
+    void collect(List<Param> out) {
+        for (int h = 0; h < numHeads; h++) { out.add(pQ[h]); out.add(pK[h]); out.add(pV[h]); }
+        out.add(pO);
     }
 
     public Matrix forward(Matrix X) {
@@ -60,18 +86,15 @@ public class AttentionLayer {
         return X.add(attnOutput);
     }
 
-    public Matrix backward(Matrix dLayerOutput, double learningRate) {
+    /** Returns the gradient for the input and ADDS the weight gradients to the Params (no weight update here). */
+    public Matrix backward(Matrix dLayerOutput) {
         int T = X.rows();
 
         Matrix dConcatOutput = dLayerOutput.multiplyByTranspose(Wo);
-        Matrix dWo = concatOutput.transposeMultiply(dLayerOutput);
+        pO.addGrad(concatOutput.transposeMultiply(dLayerOutput));
 
         Matrix[] dHeadOutputs = splitByHead(dConcatOutput, T);
         Matrix dX = dLayerOutput;
-
-        Matrix[] dWqArr = new Matrix[numHeads];
-        Matrix[] dWkArr = new Matrix[numHeads];
-        Matrix[] dWvArr = new Matrix[numHeads];
 
         for (int h = 0; h < numHeads; h++) {
             Matrix dV_h = attnWeights[h].transposeMultiply(dHeadOutputs[h]);
@@ -89,9 +112,9 @@ public class AttentionLayer {
             Matrix dQ_h = dScores_h.multiply(K[h]);
             Matrix dK_h = dScores_h.transposeMultiply(Q[h]);
 
-            dWqArr[h] = X.transposeMultiply(dQ_h);
-            dWkArr[h] = X.transposeMultiply(dK_h);
-            dWvArr[h] = X.transposeMultiply(dV_h);
+            pQ[h].addGrad(X.transposeMultiply(dQ_h));
+            pK[h].addGrad(X.transposeMultiply(dK_h));
+            pV[h].addGrad(X.transposeMultiply(dV_h));
 
             Matrix dX_fromHead = dQ_h.multiplyByTranspose(Wq[h])
                 .add(dK_h.multiplyByTranspose(Wk[h]))
@@ -99,14 +122,6 @@ public class AttentionLayer {
 
             dX = dX.add(dX_fromHead);
         }
-
-        for (int h = 0; h < numHeads; h++) {
-            Wq[h] = adamQ[h].step(Wq[h], dWqArr[h], learningRate);
-            Wk[h] = adamK[h].step(Wk[h], dWkArr[h], learningRate);
-            Wv[h] = adamV[h].step(Wv[h], dWvArr[h], learningRate);
-        }
-        Wo = adamO.step(Wo, dWo, learningRate);
-
         return dX;
     }
 

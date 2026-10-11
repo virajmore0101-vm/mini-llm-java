@@ -18,38 +18,23 @@ public class Adam {
         v = new double[size];
     }
 
-    /** Updates param in place. */
-    public void step(double[] param, double[] grad, double lr) {
+    /** Updates the weights w in place. w and g have the same shape; m and v are indexed row by row. */
+    public void step(double[][] w, double[][] g, double lr) {
         if (PLAIN_SGD_FOR_GRADIENT_CHECK) {
-            for (int i = 0; i < param.length; i++) param[i] -= lr * grad[i];
+            for (int r = 0; r < w.length; r++) for (int c = 0; c < w[r].length; c++) w[r][c] -= lr * g[r][c];
             return;
         }
         t++;
         double correction1 = 1 - Math.pow(BETA1, t);
         double correction2 = 1 - Math.pow(BETA2, t);
-        for (int i = 0; i < param.length; i++) {
-            m[i] = BETA1 * m[i] + (1 - BETA1) * grad[i];
-            v[i] = BETA2 * v[i] + (1 - BETA2) * grad[i] * grad[i];
-            param[i] -= lr * (m[i] / correction1) / (Math.sqrt(v[i] / correction2) + EPS);
-        }
-    }
-
-    /** Same thing for a matrix; returns the updated matrix. */
-    public Matrix step(Matrix param, Matrix grad, double lr) {
-        int rows = param.rows(), cols = param.cols();
-        double[] p = new double[rows * cols];
-        double[] g = new double[rows * cols];
-        for (int r = 0; r < rows; r++) {
-            for (int c = 0; c < cols; c++) {
-                p[r * cols + c] = param.get(r, c);
-                g[r * cols + c] = grad.get(r, c);
+        int i = 0;
+        for (int r = 0; r < w.length; r++) {
+            double[] wr = w[r], gr = g[r];
+            for (int c = 0; c < wr.length; c++, i++) {
+                m[i] = BETA1 * m[i] + (1 - BETA1) * gr[c];
+                v[i] = BETA2 * v[i] + (1 - BETA2) * gr[c] * gr[c];
+                wr[c] -= lr * (m[i] / correction1) / (Math.sqrt(v[i] / correction2) + EPS);
             }
         }
-        step(p, g, lr);
-        Matrix result = new Matrix(rows, cols);
-        for (int r = 0; r < rows; r++) {
-            for (int c = 0; c < cols; c++) result.set(r, c, p[r * cols + c]);
-        }
-        return result;
     }
 }

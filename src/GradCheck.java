@@ -6,6 +6,7 @@ public class GradCheck {
     static Random pick = new Random(1);
     static int checked = 0, bad = 0;
     static double worst = 0;
+
     static double maxGrad = 0;
 
     static void cmp(String name, double analytic, double numeric) {
@@ -97,5 +98,92 @@ public class GradCheck {
         Adam.PLAIN_SGD_FOR_GRADIENT_CHECK = false;
         System.out.printf("GRADIENTS: %d weights checked (largest gradient %.1e), %d mismatches, worst relative error %.1e %s%n",
             checked, maxGrad, bad, worst, bad == 0 ? "(OK)" : "(FAIL)");
+
+        // 3) mini-batches and threads: the averaged gradient of a batch computed by several threads must be the true derivative
+        //    of the batch's average loss, and must match what a single thread computes.
+        int NB = 8, smallerStep = 0;
+        String[] batch = new String[NB];
+        for (int i = 0; i < NB; i++) batch[i] = text.substring(2000 + 777 * i, 2000 + 777 * i + T + 1);
+        int before = checked, badBefore = bad;
+        double worstBefore = worst;
+        worst = 0; maxGrad = 0;
+        Adam.PLAIN_SGD_FOR_GRADIENT_CHECK = true;
+        MultiLayerTransformer live = new MultiLayerTransformer(text, T, D, L, H, 0.001);   // used only to measure the loss
+        MultiLayerTransformer single = new MultiLayerTransformer(text, T, D, L, H, 0.001);
+        MultiLayerTransformer multi = new MultiLayerTransformer(text, T, D, L, H, 0.001);
+        multi.setThreads(3);
+        double[][][] w0 = snapshot(multi);
+        double lossSingle = single.trainBatch(batch), lossMulti = multi.trainBatch(batch);
+        DoubleSupplier batchLoss = () -> live.batchLoss(batch);
+        for (int i = 0; i < multi.params.size(); i++) {
+            double[][] w = live.params.get(i).w;
+            for (int t = 0; t < 3; t++) {
+                int r = pick.nextInt(w.length), c = pick.nextInt(w[0].length);
+                double analytic = (w0[i][r][c] - multi.params.get(i).w[r][c]) / lr;
+                double numeric = slope(w, r, c, 1e-5, batchLoss);
+                // A ReLU can switch on or off inside the finite-difference step (more likely with 8 windows), which distorts the
+                // numerical slope but not the true gradient. Disagreement is therefore re-measured with much smaller steps.
+                for (double eps = 1e-6; eps >= 1e-8 && disagrees(analytic, numeric, 1e-5); eps /= 10) { numeric = slope(w, r, c, eps, batchLoss); smallerStep++; }
+                cmp("batch.param" + i + "[" + r + "," + c + "]", analytic, numeric);
+            }
+        }
+        double diff = maxDifference(single, multi);
+        System.out.println("  (" + smallerStep + " smaller-step re-measurement(s) were needed because a ReLU switched inside the step)");
+        Adam.PLAIN_SGD_FOR_GRADIENT_CHECK = false;
+        System.out.printf("BATCH GRADIENTS (batch of %d, 3 threads): %d weights checked, %d mismatches, worst relative error %.1e %s%n",
+            NB, checked - before, bad - badBefore, worst, bad == badBefore ? "(OK)" : "(FAIL)");
+        System.out.printf("1 THREAD vs 3 THREADS, one SGD step: batch loss %.12f vs %.12f, largest weight difference %.1e %s%n",
+            lossSingle, lossMulti, diff, diff < 1e-12 && Math.abs(lossSingle - lossMulti) < 1e-12 ? "(OK)" : "(FAIL)");
+
+        // the same with Adam for 30 batches, plus evaluation with different thread counts
+        MultiLayerTransformer s1 = new MultiLayerTransformer(text, T, D, L, H, 0.001);
+        MultiLayerTransformer s3 = new MultiLayerTransformer(text, T, D, L, H, 0.001);
+        s3.setThreads(3);
+        Random r = new Random(11);
+        double lossGap = 0;
+        for (int step = 0; step < 30; step++) {
+            for (int i = 0; i < NB; i++) { int st = r.nextInt(text.length() - T - 1); batch[i] = text.substring(st, st + T + 1); }
+            lossGap = Math.max(lossGap, Math.abs(s1.trainBatch(batch) - s3.trainBatch(batch)));
+        }
+        double diffAdam = maxDifference(s1, s3);
+        String heldOut = text.substring(10000);
+        double e1 = s1.evaluate(heldOut, 100);
+        s1.setThreads(3);
+        double e3 = s1.evaluate(heldOut, 100);
+        System.out.printf("30 ADAM BATCHES, 1 thread vs 3 threads: largest loss difference %.1e, largest weight difference %.1e %s%n",
+            lossGap, diffAdam, diffAdam < 1e-8 ? "(OK)" : "(FAIL)");
+        System.out.printf("EVALUATE, 1 thread vs 3 threads: %.12f vs %.12f %s%n", e1, e3, e1 == e3 ? "(identical, OK)" : "(FAIL)");
+    }
+
+    static boolean disagrees(double analytic, double numeric, double relativeTolerance) {
+        double diff = Math.abs(analytic - numeric);
+        return diff > 1e-6 && diff / (Math.abs(analytic) + Math.abs(numeric)) > relativeTolerance;
+    }
+
+    static double slope(double[][] w, int r, int c, double eps, DoubleSupplier loss) {
+        double orig = w[r][c];
+        w[r][c] = orig + eps; double up = loss.getAsDouble();
+        w[r][c] = orig - eps; double dn = loss.getAsDouble();
+        w[r][c] = orig;
+        return (up - dn) / (2 * eps);
+    }
+
+    static double[][][] snapshot(MultiLayerTransformer m) {
+        double[][][] out = new double[m.params.size()][][];
+        for (int i = 0; i < out.length; i++) {
+            double[][] w = m.params.get(i).w;
+            out[i] = new double[w.length][];
+            for (int r = 0; r < w.length; r++) out[i][r] = w[r].clone();
+        }
+        return out;
+    }
+
+    static double maxDifference(MultiLayerTransformer a, MultiLayerTransformer b) {
+        double worstDiff = 0;
+        for (int i = 0; i < a.params.size(); i++) {
+            double[][] x = a.params.get(i).w, y = b.params.get(i).w;
+            for (int r = 0; r < x.length; r++) for (int c = 0; c < x[r].length; c++) worstDiff = Math.max(worstDiff, Math.abs(x[r][c] - y[r][c]));
+        }
+        return worstDiff;
     }
 }

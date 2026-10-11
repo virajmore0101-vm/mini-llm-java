@@ -12,9 +12,10 @@ public class ChatTransformer {
     static final int DEFAULT_CHARS = 200000;    // how much of the file to train on
     static final int DEFAULT_VAL_CHARS = 5000;  // the next piece of the file, held out and used only to measure quality
     static final int DEFAULT_CONTEXT = 32;      // how many characters the model sees at once
-    static final int DIM = 24;
-    static final int LAYERS = 3;
-    static final int HEADS = 4;
+    static final int DEFAULT_DIM = 64;          // width of the model; 24 was the old size (24,000 parameters), 64 is about 156,000
+    static final int DEFAULT_LAYERS = 3;
+    static final int DEFAULT_HEADS = 4;         // dim must be divisible by heads
+    static final int DEFAULT_BATCH = 16;        // windows per update: their gradients are averaged, then one Adam step is made
     static final double LEARNING_RATE = 0.001;  // Adam, at the start of training
     static final double LR_END_FRACTION = 0.1;  // the learning rate shrinks linearly to this fraction by the end
     static final int DEFAULT_SECONDS = 420;
@@ -25,13 +26,17 @@ public class ChatTransformer {
     static final long SEED = 123;               // fixed seed: same settings give the same run
     static final String LOG = "results.log";
     static final Pattern WORD = Pattern.compile("[a-z]+(?:'[a-z]+)*");
-    static final List<String> KEYS = Arrays.asList("seconds", "context", "lr", "data", "chars", "valchars", "valstart", "name");
+    static final List<String> KEYS = Arrays.asList("seconds", "context", "lr", "data", "chars", "valchars", "valstart", "name", "dim", "layers", "heads", "batch", "threads", "windows");
 
     static Map<String, String> opt = new HashMap<>();
     static int intOpt(String k, int dflt) { return opt.containsKey(k) ? Integer.parseInt(opt.get(k)) : dflt; }
 
     // usage:  java ChatTransformer [key=value ...]        train, then chat
-    //   keys: seconds context lr data chars valchars valstart name   (old style also works: java ChatTransformer 420 10 0.001)
+    //   keys: seconds context lr data chars valchars valstart name dim layers heads batch threads   (old style also works: java ChatTransformer 420 10 0.001)
+    //   dim/layers/heads set the model size; batch = windows per update; threads = CPU threads to use (default: all cores).
+    //   dim=24 batch=1 threads=1 is the same model and training as Step 21 (except the learning rate is now lowered after every update, not every 128).
+    //   windows=N trains for exactly N windows instead of for `seconds` (the learning rate shrinks over those N windows), so runs
+    //   on machines of different speed, or with different model sizes, do the same amount of training and can be compared fairly.
     //   valstart=N takes the held-out text from position N of the file instead of right after the training text,
     //   so runs with different amounts of training text can be scored on exactly the same held-out passage.
     //         java ChatTransformer chat [name=...]          chat with a saved model, no training
@@ -62,6 +67,11 @@ public class ChatTransformer {
         double lr = opt.containsKey("lr") ? Double.parseDouble(opt.get("lr")) : LEARNING_RATE;
         String dataFile = opt.getOrDefault("data", DEFAULT_DATA);
         int valChars = intOpt("valchars", DEFAULT_VAL_CHARS);
+        int dim = intOpt("dim", DEFAULT_DIM), layers = intOpt("layers", DEFAULT_LAYERS), heads = intOpt("heads", DEFAULT_HEADS);
+        int batch = intOpt("batch", DEFAULT_BATCH);
+        long maxWindows = opt.containsKey("windows") ? Long.parseLong(opt.get("windows")) : 0;
+        int threads = intOpt("threads", Runtime.getRuntime().availableProcessors());
+        if (dim % heads != 0 || batch < 1 || threads < 1 || layers < 1) { System.out.println("Need dim divisible by heads, and batch, threads, layers >= 1."); return; }
 
         String all = clean(new String(Files.readAllBytes(Paths.get(dataFile)), StandardCharsets.UTF_8));
         int valStart = opt.containsKey("valstart") ? intOpt("valstart", 0) : -1;
@@ -75,32 +85,37 @@ public class ChatTransformer {
         Matcher wm = WORD.matcher(all.toLowerCase());
         while (wm.find()) realWords.add(wm.group());
 
-        String settings = String.format("data=%s chars=%d val@%d context=%d dim=%d layers=%d heads=%d lr=%s", dataFile, trainChars, valStart, T, DIM, LAYERS, HEADS, lr);
-        System.out.printf("Training for up to %d seconds (%s).%n", maxSeconds, settings);
-        MultiLayerTransformer model = new MultiLayerTransformer(train, T, DIM, LAYERS, HEADS, lr);
-        System.out.printf("Vocabulary: %d characters. Before training: val loss %.3f (pure guessing = %.2f; lower is better)%n",
-            model.vocabSize, model.evaluate(val, 1000), Math.log(model.vocabSize));
-        System.out.println("  passes = how many times the text's characters have been used as prediction targets");
+        String settings = String.format("data=%s chars=%d val@%d context=%d dim=%d layers=%d heads=%d batch=%d threads=%d lr=%s%s", dataFile, trainChars, valStart, T, dim, layers, heads, batch, threads, lr, maxWindows > 0 ? " windows=" + maxWindows : "");
+        System.out.printf("Training for %s (%s).%n", maxWindows > 0 ? String.format("%,d windows", maxWindows) : "up to " + maxSeconds + " seconds", settings);
+        MultiLayerTransformer model = new MultiLayerTransformer(train, T, dim, layers, heads, lr);
+        model.setThreads(threads);
+        System.out.printf("Model: %,d parameters. Vocabulary: %d characters. Before training: val loss %.3f (pure guessing = %.2f; lower is better)%n",
+            model.parameterCount(), model.vocabSize, model.evaluate(val, 1000), Math.log(model.vocabSize));
+        System.out.println("  windows = training snippets processed; passes = how many times the text's characters have been used as prediction targets");
 
         Random rng = new Random(SEED);
         long start = System.currentTimeMillis(), nextReport = start + REPORT_SECONDS * 1000L;
-        long steps = 0;
+        long steps = 0;                 // windows processed (one update uses `batch` of them)
+        String[] windows = new String[batch];
         double runLoss = 0; int runN = 0, bestSeconds = 0;
         double bestVal = Double.MAX_VALUE;
         double[] st = {0, 0};
         boolean done = false;
         while (!done) {
-            int s = rng.nextInt(train.length() - T - 1);                   // random window, so no part of the text is favored
-            runLoss += model.trainSequence(train.substring(s, s + T + 1));
-            runN++; steps++;
-            if ((steps & 127) != 0) continue;
+            for (int i = 0; i < batch; i++) {
+                int s = rng.nextInt(train.length() - T - 1);                // random windows, so no part of the text is favored
+                windows[i] = train.substring(s, s + T + 1);
+            }
+            runLoss += model.trainBatch(windows);
+            runN++; steps += batch;
             long now = System.currentTimeMillis();
-            done = now - start >= maxSeconds * 1000L;
-            model.learningRate = lr * (1 - (1 - LR_END_FRACTION) * Math.min(1.0, (now - start) / (maxSeconds * 1000.0)));
+            double progress = maxWindows > 0 ? (double) steps / maxWindows : (now - start) / (maxSeconds * 1000.0);
+            done = progress >= 1.0;
+            model.learningRate = lr * (1 - (1 - LR_END_FRACTION) * Math.min(1.0, progress));
             if (now >= nextReport || done) {
                 double v = model.evaluate(val, 1000);
                 st = textStats(model, val.substring(0, T), realWords, train);
-                System.out.printf("%4ds | %,9d steps | %5.1f passes | train %.3f | train-eval %.3f | val %.3f | real words %2.0f%% | copied %2.0f%%%n",
+                System.out.printf("%4ds | %,9d windows | %5.1f passes | train %.3f | train-eval %.3f | val %.3f | real words %2.0f%% | copied %2.0f%%%n",
                     (now - start) / 1000, steps, (double) steps * T / train.length(), runLoss / runN,
                     model.evaluate(probe, 1000), v, st[0], st[1]);
                 if (v < bestVal) { bestVal = v; bestSeconds = (int) ((now - start) / 1000); model.save(best); }
@@ -110,13 +125,13 @@ public class ChatTransformer {
         }
         model.save(last);
         double finalVal = model.evaluate(val, 1000), finalTrain = model.evaluate(probe, 1000);
-        System.out.printf("Done. %,d steps. Final val %.3f (train-eval %.3f). Best val %.3f at %ds, saved to %s.%n",
-            steps, finalVal, finalTrain, bestVal, bestSeconds, best);
+        System.out.printf("Done. %,d windows (%,.0f per second). Final val %.3f (train-eval %.3f). Best val %.3f at %ds, saved to %s.%n",
+            steps, steps / ((System.currentTimeMillis() - start) / 1000.0), finalVal, finalTrain, bestVal, bestSeconds, best);
         String sample = generate(model, val.substring(0, T), 300, new Random(99));
         System.out.println("Sample (temperature " + TEMPERATURE + "):\n" + sample + "\n");
 
-        String line = String.format("%s | %s | %ds %,d steps | best val %.3f @%ds | final val %.3f | train-eval %.3f | real words %.0f%% | copied %.0f%%%n",
-            LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")), settings, maxSeconds, steps,
+        String line = String.format("%s | %s | %ds %,d windows | %,d params | best val %.3f @%ds | final val %.3f | train-eval %.3f | real words %.0f%% | copied %.0f%%%n",
+            LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")), settings, (System.currentTimeMillis() - start) / 1000, steps, model.parameterCount(),
             bestVal, bestSeconds, finalVal, finalTrain, st[0], st[1]);
         Files.writeString(Paths.get(LOG), line, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
 

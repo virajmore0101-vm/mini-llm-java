@@ -8,15 +8,25 @@ import java.util.*;
  */
 public class FeedForward {
     Matrix W1, W2;
-    private Adam adam1, adam2;
+    Param p1, p2;
     private Matrix X, preActivation, hidden;
 
     public FeedForward(int d, int hiddenSize, Random rand) {
         W1 = AttentionLayer.randomMatrix(d, hiddenSize, rand, 0.3);
         W2 = AttentionLayer.randomMatrix(hiddenSize, d, rand, 0.3);
-        adam1 = new Adam(d * hiddenSize);
-        adam2 = new Adam(hiddenSize * d);
+        p1 = new Param(W1);
+        p2 = new Param(W2);
     }
+
+    /** A helper that shares the weights of `master` but has its own memory of the last forward pass and its own gradients. */
+    FeedForward(FeedForward master) {
+        W1 = new Matrix(master.W1.raw());
+        W2 = new Matrix(master.W2.raw());
+        p1 = new Param(W1);
+        p2 = new Param(W2);
+    }
+
+    void collect(List<Param> out) { out.add(p1); out.add(p2); }
 
     public Matrix forward(Matrix X) {
         this.X = X;
@@ -26,22 +36,18 @@ public class FeedForward {
         return X.add(ffOutput);
     }
 
-    public Matrix backward(Matrix dLayerOutput, double learningRate) {
+    /** Returns the gradient for the input and ADDS the weight gradients to p1 and p2 (no weight update here). */
+    public Matrix backward(Matrix dLayerOutput) {
         Matrix dFFOutput = dLayerOutput;
 
         Matrix dHidden = dFFOutput.multiplyByTranspose(W2);
-        Matrix dW2 = hidden.transposeMultiply(dFFOutput);
+        p2.addGrad(hidden.transposeMultiply(dFFOutput));
 
         Matrix dPreActivation = reluBackward(dHidden, preActivation);
-        Matrix dW1 = X.transposeMultiply(dPreActivation);
+        p1.addGrad(X.transposeMultiply(dPreActivation));
         Matrix dX_fromFF = dPreActivation.multiplyByTranspose(W1);
 
-        Matrix dX = dLayerOutput.add(dX_fromFF);
-
-        W1 = adam1.step(W1, dW1, learningRate);
-        W2 = adam2.step(W2, dW2, learningRate);
-
-        return dX;
+        return dLayerOutput.add(dX_fromFF);
     }
 
     private static Matrix relu(Matrix m) {

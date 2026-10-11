@@ -19,6 +19,9 @@ public class Matrix {
     public int rows() { return rows; }
     public int cols() { return cols; }
 
+    /** The underlying numbers (not a copy). Param uses this so the optimizer can update weights in place. */
+    double[][] raw() { return values; }
+
     public double get(int r, int c) { return values[r][c]; }
     public void set(int r, int c, double v) { values[r][c] = v; }
 
