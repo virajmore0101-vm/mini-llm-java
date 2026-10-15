@@ -4,10 +4,12 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class MultiLayerTransformer {
-    static final int EVAL_START = 64;   // validation always predicts characters at index >= 64, so every model sees the same targets
+    static final int EVAL_START = 64;   // validation only scores text from character 64 on, so every model is scored on the same part of the passage
     static final double EMBED_INIT = 0.5, OUT_INIT = 0.1;
+    static final int FILE_FORMAT = 2;   // checkpoint files start with -FILE_FORMAT; older files start directly with the context length
 
     int vocabSize, d, contextLength, numLayers, numHeads;
+    Tokenizer tokenizer;
     Matrix embeddingTable;
     AttentionLayer[] layers;
     FeedForward[] feedforwards;
@@ -17,8 +19,6 @@ public class MultiLayerTransformer {
     Param pEmb, pOut;
     List<Param> params = new ArrayList<>();   // every learnable block, in the same fixed order in every copy of the model
     double learningRate;
-    Map<Character, Integer> charToIndex = new HashMap<>();
-    char[] indexToChar;
 
     // Threading: `workers` are copies of this model that share its weights but have their own gradients and their own
     // memory of the last forward pass, so several windows can be processed at the same time without getting in each other's way.
@@ -26,20 +26,20 @@ public class MultiLayerTransformer {
     private MultiLayerTransformer[] workers;
     private ExecutorService pool;
 
-    /** The vocabulary is every distinct character in `text` (pass the saved vocabulary string when loading a checkpoint). */
+    /** Character-level model: the vocabulary is every distinct character in `text`. */
     public MultiLayerTransformer(String text, int contextLength, int d, int numLayers, int numHeads, double learningRate) {
+        this(Tokenizer.chars(text), contextLength, d, numLayers, numHeads, learningRate);
+    }
+
+    /** Model over any tokenizer (single characters, or word-pieces learned with Tokenizer.train). */
+    public MultiLayerTransformer(Tokenizer tokenizer, int contextLength, int d, int numLayers, int numHeads, double learningRate) {
+        this.tokenizer = tokenizer;
+        this.vocabSize = tokenizer.size();
         this.contextLength = contextLength;
         this.d = d;
         this.numLayers = numLayers;
         this.numHeads = numHeads;
         this.learningRate = learningRate;
-
-        Set<Character> unique = new TreeSet<>();
-        for (char c : text.toCharArray()) unique.add(c);
-        vocabSize = unique.size();
-        indexToChar = new char[vocabSize];
-        int idx = 0;
-        for (char c : unique) { charToIndex.put(c, idx); indexToChar[idx] = c; idx++; }
 
         Random rand = new Random(7);
         embeddingTable = AttentionLayer.randomMatrix(vocabSize, d, rand, EMBED_INIT);
@@ -63,8 +63,7 @@ public class MultiLayerTransformer {
     private MultiLayerTransformer(MultiLayerTransformer m) {
         vocabSize = m.vocabSize; d = m.d; contextLength = m.contextLength; numLayers = m.numLayers; numHeads = m.numHeads;
         learningRate = m.learningRate;
-        charToIndex = m.charToIndex;    // never changed after construction, so safe to read from every thread
-        indexToChar = m.indexToChar;
+        tokenizer = m.tokenizer;        // never changed after construction, so safe to use from every thread
         embeddingTable = new Matrix(m.embeddingTable.raw());
         Wout = new Matrix(m.Wout.raw());
         layers = new AttentionLayer[numLayers];
@@ -129,11 +128,11 @@ public class MultiLayerTransformer {
         }
     }
 
-    private Matrix embed(String context) {
-        int T = context.length();
-        Matrix X = new Matrix(T, d);
-        for (int i = 0; i < T; i++) {
-            int ci = charToIndex.get(context.charAt(i));
+    /** Embeddings (plus position encodings) of the first n token ids. */
+    private Matrix embed(int[] ids, int n) {
+        Matrix X = new Matrix(n, d);
+        for (int i = 0; i < n; i++) {
+            int ci = ids[i];
             for (int k = 0; k < d; k++) X.set(i, k, embeddingTable.get(ci, k) + positionalEncoding(i, k));
         }
         return X;
@@ -156,23 +155,24 @@ public class MultiLayerTransformer {
     }
 
     /** Hidden state of every position (used by GradCheck to prove position i never sees the future). */
-    Matrix hiddenStates(String context) { return forwardLayers(embed(context)); }
+    Matrix hiddenStatesIds(int[] ids) { return forwardLayers(embed(ids, ids.length)); }
+    Matrix hiddenStates(String context) { return hiddenStatesIds(tokenizer.encode(context)); }
 
     /**
-     * Forward and backward pass on one window of T+1 characters: the first T are the input, and at EVERY position i
-     * the model must predict character i+1. The loss is the average over the T positions.
+     * Forward and backward pass on one window of T+1 tokens: the first T are the input, and at EVERY position i
+     * the model must predict token i+1. The loss is the average over the T positions.
      * The gradients are ADDED to this model's Params; nothing is updated yet. Returns the window's loss.
      */
-    private double accumulate(String window) {
-        int n = window.length() - 1;
-        Matrix F = forwardLayers(embed(window.substring(0, n)));
+    private double accumulate(int[] window) {
+        int n = window.length - 1;
+        Matrix F = forwardLayers(embed(window, n));
         Matrix logits = F.multiply(Wout);
 
         Matrix dLogits = new Matrix(n, vocabSize);
         double loss = 0;
         for (int i = 0; i < n; i++) {
             double[] probs = softmaxRow(logits, i);
-            int target = charToIndex.get(window.charAt(i + 1));
+            int target = window[i + 1];
             loss -= Math.log(probs[target] + 1e-9);
             for (int v = 0; v < vocabSize; v++) dLogits.set(i, v, (probs[v] - (v == target ? 1.0 : 0.0)) / n);
         }
@@ -186,7 +186,7 @@ public class MultiLayerTransformer {
             dCurrent = layers[i].backward(dCurrent);
         }
         for (int i = 0; i < n; i++) {
-            double[] row = pEmb.g[charToIndex.get(window.charAt(i))];
+            double[] row = pEmb.g[window[i]];
             for (int k = 0; k < d; k++) row[k] += dCurrent.get(i, k);
         }
         return loss / n;
@@ -194,24 +194,26 @@ public class MultiLayerTransformer {
 
     private void zeroGrad() { for (Param p : params) p.zeroGrad(); }
 
-    /** One training step on a single window (gradient, then one Adam update). Returns the window's loss. */
-    public double trainSequence(String window) {
+    /** One training step on a single window (gradient, then one Adam update). Returns the window's loss (per token). */
+    public double trainSequence(int[] window) {
         zeroGrad();
         double loss = accumulate(window);
         for (Param p : params) p.step(learningRate);
         return loss;
     }
 
+    public double trainSequence(String window) { return trainSequence(tokenizer.encode(window)); }
+
     /**
      * One training step on a batch of windows: the gradients of all windows are averaged and ONE Adam update is made.
-     * With setThreads(n) the windows are processed by n threads at once. Returns the average loss of the batch.
+     * With setThreads(n) the windows are processed by n threads at once. Returns the average loss (per token) of the batch.
      */
-    public double trainBatch(String[] windows) {
+    public double trainBatch(int[][] windows) {
         int B = windows.length;
         if (threads <= 1) {
             zeroGrad();
             double loss = 0;
-            for (String w : windows) loss += accumulate(w);
+            for (int[] w : windows) loss += accumulate(w);
             for (Param p : params) { p.scaleGrad(1.0 / B); p.step(learningRate); }
             return loss / B;
         }
@@ -241,26 +243,34 @@ public class MultiLayerTransformer {
         return loss / B;
     }
 
-    /** Average of sequenceLoss over the windows (what trainBatch's gradient is the derivative of). */
-    public double batchLoss(String[] windows) {
-        double s = 0;
-        for (String w : windows) s += sequenceLoss(w);
-        return s / windows.length;
+    public double trainBatch(String[] windows) {
+        int[][] ids = new int[windows.length][];
+        for (int i = 0; i < ids.length; i++) ids[i] = tokenizer.encode(windows[i]);
+        return trainBatch(ids);
     }
 
     /** Forward pass only, same average loss as trainSequence (used for gradient checking). */
-    public double sequenceLoss(String window) {
-        int n = window.length() - 1;
-        Matrix logits = forwardLayers(embed(window.substring(0, n))).multiply(Wout);
+    public double sequenceLoss(int[] window) {
+        int n = window.length - 1;
+        Matrix logits = forwardLayers(embed(window, n)).multiply(Wout);
         double loss = 0;
-        for (int i = 0; i < n; i++) loss -= Math.log(softmaxRow(logits, i)[charToIndex.get(window.charAt(i + 1))] + 1e-9);
+        for (int i = 0; i < n; i++) loss -= Math.log(softmaxRow(logits, i)[window[i + 1]] + 1e-9);
         return loss / n;
     }
 
-    /** Scores for the next character after `context` (the last contextLength characters are used). */
-    private double[] nextLogits(String context) {
-        if (context.length() > contextLength) context = context.substring(context.length() - contextLength);
-        Matrix F = forwardLayers(embed(context));
+    public double sequenceLoss(String window) { return sequenceLoss(tokenizer.encode(window)); }
+
+    /** Average of sequenceLoss over the windows (what trainBatch's gradient is the derivative of). */
+    public double batchLoss(int[][] windows) {
+        double s = 0;
+        for (int[] w : windows) s += sequenceLoss(w);
+        return s / windows.length;
+    }
+
+    /** Scores for the next token after `context` (the last contextLength tokens are used). */
+    private double[] nextLogits(int[] context) {
+        int[] c = context.length > contextLength ? Arrays.copyOfRange(context, context.length - contextLength, context.length) : context;
+        Matrix F = forwardLayers(embed(c, c.length));
         int last = F.rows() - 1;
         double[] logits = new double[vocabSize];
         for (int v = 0; v < vocabSize; v++) {
@@ -272,66 +282,88 @@ public class MultiLayerTransformer {
     }
 
     /**
-     * Average loss when predicting the character at positions EVAL_START, EVAL_START+stride, ... of `text`,
-     * given the previous contextLength characters. Lower is better; pure guessing is ln(vocabSize).
-     * Skips targets whose characters the model has never seen.
+     * Average loss PER CHARACTER of the model on `text`, in nats (lower is better; guessing at random is ln(vocabulary) per token).
+     * Tokens at positions EVAL_START, ... of the text (and with a full context of contextLength tokens before them) are predicted
+     * and scored; the total loss is divided by the number of characters those tokens stand for, so a character-level model and a
+     * word-piece model can be compared on the same passage. Characters without a token are skipped.
      */
     public double evaluate(String text, int maxWindows) {
         int T = contextLength;
-        int start = Math.max(EVAL_START, T);
-        if (text.length() <= start) return Double.NaN;
-        int stride = Math.max(1, (text.length() - start) / maxWindows);
-        int count = (text.length() - start + stride - 1) / stride;
+        int[] ids = tokenizer.encode(text);
+        int[] charStart = new int[ids.length + 1];
+        for (int i = 0; i < ids.length; i++) charStart[i + 1] = charStart[i] + tokenizer.tokenText(ids[i]).length();
+        int start = T;
+        while (start < ids.length && charStart[start] < EVAL_START) start++;
+        if (ids.length <= start) return Double.NaN;
+        int stride = Math.max(1, (ids.length - start) / maxWindows);
+        int count = (ids.length - start + stride - 1) / stride;
         double[] losses = new double[count];
+        final int firstPosition = start, step = stride;
         if (threads <= 1) {
-            for (int i = 0; i < count; i++) losses[i] = positionLoss(text, start + i * stride);
+            for (int i = 0; i < count; i++) losses[i] = positionLoss(ids, firstPosition + i * step);
         } else {
             runOnWorkers((wk, id) -> {
-                for (int i = id; i < count; i += workers.length) losses[i] = wk.positionLoss(text, start + i * stride);
+                for (int i = id; i < count; i += workers.length) losses[i] = wk.positionLoss(ids, firstPosition + i * step);
             });
         }
         double sum = 0;
-        int n = 0;
-        for (double l : losses) if (!Double.isNaN(l)) { sum += l; n++; }   // summed in a fixed order, so the result does not depend on the thread count
-        return n == 0 ? Double.NaN : sum / n;
+        long chars = 0;                                   // summed in a fixed order, so the result does not depend on the thread count
+        for (int i = 0; i < count; i++) { sum += losses[i]; chars += tokenizer.tokenText(ids[firstPosition + i * step]).length(); }
+        return sum / chars;
     }
 
-    /** Loss of predicting text[p] from the previous contextLength characters; NaN if any of those characters is unknown. */
-    private double positionLoss(String text, int p) {
-        int T = contextLength;
-        String ctx = text.substring(p - T, p);
-        char next = text.charAt(p);
-        boolean known = charToIndex.containsKey(next);
-        for (int j = 0; j < T && known; j++) known = charToIndex.containsKey(ctx.charAt(j));
-        if (!known) return Double.NaN;
-        return -Math.log(softmax(nextLogits(ctx))[charToIndex.get(next)] + 1e-9);
+    /** Loss of predicting ids[p] from the previous contextLength tokens. */
+    private double positionLoss(int[] ids, int p) {
+        int[] ctx = Arrays.copyOfRange(ids, p - contextLength, p);
+        return -Math.log(softmax(nextLogits(ctx))[ids[p]] + 1e-9);
     }
 
+    /** The most likely next character after `context` (the first character of the most likely next token). */
     public char predict(String context) {
-        double[] logits = nextLogits(context);
+        double[] logits = nextLogits(tokenizer.encode(context));
         int best = 0;
         for (int i = 1; i < logits.length; i++) if (logits[i] > logits[best]) best = i;
-        return indexToChar[best];
+        return tokenizer.tokenText(best).charAt(0);
     }
 
     /** Temperature below 1.0 plays it safer (more coherent, less varied); above 1.0 gets wilder. */
-    public char sampleNext(String context, Random rand, double temperature) {
+    public int sampleNextId(int[] context, Random rand, double temperature) {
         double[] logits = nextLogits(context);
         for (int i = 0; i < logits.length; i++) logits[i] /= temperature;
         double[] probs = softmax(logits);
         double r = rand.nextDouble(), cumulative = 0;
         for (int i = 0; i < probs.length; i++) {
             cumulative += probs[i];
-            if (r < cumulative) return indexToChar[i];
+            if (r < cumulative) return i;
         }
-        return indexToChar[probs.length - 1];
+        return probs.length - 1;
+    }
+
+    /**
+     * Continues `prompt` for `numChars` characters and returns only the continuation. Characters of the prompt that have no
+     * token are skipped; the prompt must contain at least one known character.
+     */
+    public String generate(String prompt, int numChars, Random rand, double temperature) {
+        int[] start = tokenizer.encode(prompt);
+        if (start.length == 0) throw new IllegalArgumentException("The prompt has no characters the model knows.");
+        int[] buf = Arrays.copyOf(start, start.length + numChars);   // a token is at least one character, so numChars tokens is enough
+        int len = start.length;
+        StringBuilder out = new StringBuilder();
+        while (out.length() < numChars) {
+            int from = Math.max(0, len - contextLength);
+            int id = sampleNextId(Arrays.copyOfRange(buf, from, len), rand, temperature);
+            buf[len++] = id;
+            out.append(tokenizer.tokenText(id));
+        }
+        return out.substring(0, numChars);
     }
 
     // ---------- saving and loading (weights only; Adam's memory is not saved) ----------
     public void save(String path) throws IOException {
         try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(path)))) {
+            out.writeInt(-FILE_FORMAT);
             out.writeInt(contextLength); out.writeInt(d); out.writeInt(numLayers); out.writeInt(numHeads);
-            out.writeUTF(new String(indexToChar));
+            tokenizer.write(out);
             writeMatrix(out, embeddingTable); writeMatrix(out, Wout);
             for (int l = 0; l < numLayers; l++) {
                 for (int h = 0; h < numHeads; h++) {
@@ -343,10 +375,14 @@ public class MultiLayerTransformer {
         }
     }
 
+    /** Loads files written by this version and by the older character-level versions. */
     public static MultiLayerTransformer load(String path) throws IOException {
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(path)))) {
-            int T = in.readInt(), d = in.readInt(), layers = in.readInt(), heads = in.readInt();
-            MultiLayerTransformer m = new MultiLayerTransformer(in.readUTF(), T, d, layers, heads, 0.0);
+            int first = in.readInt();
+            int T = first < 0 ? in.readInt() : first;           // old files start directly with the context length
+            int d = in.readInt(), layers = in.readInt(), heads = in.readInt();
+            Tokenizer tok = first < 0 ? Tokenizer.read(in) : Tokenizer.chars(in.readUTF());
+            MultiLayerTransformer m = new MultiLayerTransformer(tok, T, d, layers, heads, 0.0);
             readInto(in, m.embeddingTable); readInto(in, m.Wout);
             for (int l = 0; l < layers; l++) {
                 for (int h = 0; h < heads; h++) {

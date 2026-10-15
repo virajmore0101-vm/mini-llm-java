@@ -26,7 +26,7 @@ public class ChatTransformer {
     static final long SEED = 123;               // fixed seed: same settings give the same run
     static final String LOG = "results.log";
     static final Pattern WORD = Pattern.compile("[a-z]+(?:'[a-z]+)*");
-    static final List<String> KEYS = Arrays.asList("seconds", "context", "lr", "data", "chars", "valchars", "valstart", "name", "dim", "layers", "heads", "batch", "threads", "windows");
+    static final List<String> KEYS = Arrays.asList("seconds", "context", "lr", "data", "chars", "valchars", "valstart", "name", "dim", "layers", "heads", "batch", "threads", "windows", "vocab");
 
     static Map<String, String> opt = new HashMap<>();
     static int intOpt(String k, int dflt) { return opt.containsKey(k) ? Integer.parseInt(opt.get(k)) : dflt; }
@@ -34,6 +34,9 @@ public class ChatTransformer {
     // usage:  java ChatTransformer [key=value ...]        train, then chat
     //   keys: seconds context lr data chars valchars valstart name dim layers heads batch threads   (old style also works: java ChatTransformer 420 10 0.001)
     //   dim/layers/heads set the model size; batch = windows per update; threads = CPU threads to use (default: all cores).
+    //   vocab=N sets how the text is cut into tokens: 0 (default) = one token per character; e.g. vocab=512 = about 440 learned
+    //   word-pieces (frequent words and word-parts such as " the" or "ing") on top of the characters, so a window covers much more text.
+    //   Losses are always reported PER CHARACTER, so runs with different vocab settings can be compared on the same held-out passage.
     //   dim=24 batch=1 threads=1 is the same model and training as Step 21 (except the learning rate is now lowered after every update, not every 128).
     //   windows=N trains for exactly N windows instead of for `seconds` (the learning rate shrinks over those N windows), so runs
     //   on machines of different speed, or with different model sizes, do the same amount of training and can be compared fairly.
@@ -70,8 +73,9 @@ public class ChatTransformer {
         int dim = intOpt("dim", DEFAULT_DIM), layers = intOpt("layers", DEFAULT_LAYERS), heads = intOpt("heads", DEFAULT_HEADS);
         int batch = intOpt("batch", DEFAULT_BATCH);
         long maxWindows = opt.containsKey("windows") ? Long.parseLong(opt.get("windows")) : 0;
+        int vocab = intOpt("vocab", 0);
         int threads = intOpt("threads", Runtime.getRuntime().availableProcessors());
-        if (dim % heads != 0 || batch < 1 || threads < 1 || layers < 1) { System.out.println("Need dim divisible by heads, and batch, threads, layers >= 1."); return; }
+        if (dim % heads != 0 || batch < 1 || threads < 1 || layers < 1 || vocab < 0) { System.out.println("Need dim divisible by heads, and batch, threads, layers >= 1 and vocab >= 0."); return; }
 
         String all = clean(new String(Files.readAllBytes(Paths.get(dataFile)), StandardCharsets.UTF_8));
         int valStart = opt.containsKey("valstart") ? intOpt("valstart", 0) : -1;
@@ -85,26 +89,32 @@ public class ChatTransformer {
         Matcher wm = WORD.matcher(all.toLowerCase());
         while (wm.find()) realWords.add(wm.group());
 
-        String settings = String.format("data=%s chars=%d val@%d context=%d dim=%d layers=%d heads=%d batch=%d threads=%d lr=%s%s", dataFile, trainChars, valStart, T, dim, layers, heads, batch, threads, lr, maxWindows > 0 ? " windows=" + maxWindows : "");
+        String settings = String.format("data=%s chars=%d val@%d context=%d dim=%d layers=%d heads=%d batch=%d threads=%d lr=%s vocab=%s%s", dataFile, trainChars, valStart, T, dim, layers, heads, batch, threads, lr, vocab > 0 ? String.valueOf(vocab) : "chars", maxWindows > 0 ? " windows=" + maxWindows : "");
         System.out.printf("Training for %s (%s).%n", maxWindows > 0 ? String.format("%,d windows", maxWindows) : "up to " + maxSeconds + " seconds", settings);
-        MultiLayerTransformer model = new MultiLayerTransformer(train, T, dim, layers, heads, lr);
+        long tokenizerStart = System.currentTimeMillis();
+        Tokenizer tok = vocab > 0 ? Tokenizer.train(train, vocab) : Tokenizer.chars(train);
+        int[] trainIds = tok.encode(train);
+        double charsPerToken = (double) train.length() / trainIds.length;
+        System.out.printf("Tokenizer: %d tokens (%d characters + %d learned word-pieces), %.2f characters per token on average (built in %.1fs). A window of %d tokens covers about %.0f characters.%n",
+            tok.size(), tok.size() - tok.numMerges(), tok.numMerges(), charsPerToken, (System.currentTimeMillis() - tokenizerStart) / 1000.0, T + 1, (T + 1) * charsPerToken);
+        MultiLayerTransformer model = new MultiLayerTransformer(tok, T, dim, layers, heads, lr);
         model.setThreads(threads);
-        System.out.printf("Model: %,d parameters. Vocabulary: %d characters. Before training: val loss %.3f (pure guessing = %.2f; lower is better)%n",
-            model.parameterCount(), model.vocabSize, model.evaluate(val, 1000), Math.log(model.vocabSize));
-        System.out.println("  windows = training snippets processed; passes = how many times the text's characters have been used as prediction targets");
+        System.out.printf("Model: %,d parameters. Before training: val loss %.3f per character (pure guessing = %.2f; lower is better)%n",
+            model.parameterCount(), model.evaluate(val, 1000), Math.log(tok.size()) / charsPerToken);
+        System.out.println("  windows = training snippets processed; passes = how many times the text has been used as prediction targets; all losses are per character");
 
         Random rng = new Random(SEED);
         long start = System.currentTimeMillis(), nextReport = start + REPORT_SECONDS * 1000L;
         long steps = 0;                 // windows processed (one update uses `batch` of them)
-        String[] windows = new String[batch];
+        int[][] windows = new int[batch][];
         double runLoss = 0; int runN = 0, bestSeconds = 0;
         double bestVal = Double.MAX_VALUE;
         double[] st = {0, 0};
         boolean done = false;
         while (!done) {
             for (int i = 0; i < batch; i++) {
-                int s = rng.nextInt(train.length() - T - 1);                // random windows, so no part of the text is favored
-                windows[i] = train.substring(s, s + T + 1);
+                int s = rng.nextInt(trainIds.length - T - 1);               // random windows, so no part of the text is favored
+                windows[i] = Arrays.copyOfRange(trainIds, s, s + T + 1);
             }
             runLoss += model.trainBatch(windows);
             runN++; steps += batch;
@@ -116,7 +126,7 @@ public class ChatTransformer {
                 double v = model.evaluate(val, 1000);
                 st = textStats(model, val.substring(0, T), realWords, train);
                 System.out.printf("%4ds | %,9d windows | %5.1f passes | train %.3f | train-eval %.3f | val %.3f | real words %2.0f%% | copied %2.0f%%%n",
-                    (now - start) / 1000, steps, (double) steps * T / train.length(), runLoss / runN,
+                    (now - start) / 1000, steps, (double) steps * T / trainIds.length, runLoss / runN / charsPerToken,
                     model.evaluate(probe, 1000), v, st[0], st[1]);
                 if (v < bestVal) { bestVal = v; bestSeconds = (int) ((now - start) / 1000); model.save(best); }
                 runLoss = 0; runN = 0;
@@ -152,17 +162,14 @@ public class ChatTransformer {
         return sb.toString();
     }
 
+    /** The seed text followed by `length` generated characters. */
     static String generate(MultiLayerTransformer model, String seed, int length, Random rand) {
-        StringBuilder out = new StringBuilder(seed);
-        for (int i = 0; i < length; i++) {
-            out.append(model.sampleNext(out.substring(Math.max(0, out.length() - model.contextLength)), rand, TEMPERATURE));
-        }
-        return out.toString();
+        return model.tokenizer.filter(seed) + model.generate(seed, length, rand, TEMPERATURE);
     }
 
     /** {percent of generated words that appear somewhere in the data file, percent of generated 20-character pieces copied verbatim from the training text} */
     static double[] textStats(MultiLayerTransformer model, String seed, Set<String> realWords, String train) {
-        String text = generate(model, seed, 1000, new Random(99)).substring(seed.length());
+        String text = model.generate(seed, 1000, new Random(99), TEMPERATURE);
         List<String> words = new ArrayList<>();
         Matcher m = WORD.matcher(text.toLowerCase());
         while (m.find()) words.add(m.group());
@@ -188,15 +195,11 @@ public class ChatTransformer {
             String input = scanner.nextLine();
             if (input.equalsIgnoreCase("exit")) { System.out.println("Goodbye!"); break; }
 
-            StringBuilder out = new StringBuilder();
-            int skipped = 0;
-            for (char c : input.toCharArray()) { if (model.charToIndex.containsKey(c)) out.append(c); else skipped++; }
+            String prompt = model.tokenizer.filter(input);
+            int skipped = input.length() - prompt.length();
             if (skipped > 0) System.out.println("(Skipped " + skipped + " character(s) the model has never seen.)");
-            if (out.length() == 0) out.append('\n');
-            for (int i = 0; i < REPLY_LENGTH; i++) {
-                out.append(model.sampleNext(out.substring(Math.max(0, out.length() - model.contextLength)), rand, TEMPERATURE));
-            }
-            System.out.println("\nModel: " + out + "\n");
+            if (prompt.isEmpty()) prompt = model.tokenizer.knows('\n') ? "\n" : model.tokenizer.tokenText(0);
+            System.out.println("\nModel: " + prompt + model.generate(prompt, REPLY_LENGTH, rand, TEMPERATURE) + "\n");
         }
         scanner.close();
     }
