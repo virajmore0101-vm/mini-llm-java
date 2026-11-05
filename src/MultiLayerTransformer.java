@@ -163,18 +163,29 @@ public class MultiLayerTransformer {
      * the model must predict token i+1. The loss is the average over the T positions.
      * The gradients are ADDED to this model's Params; nothing is updated yet. Returns the window's loss.
      */
-    private double accumulate(int[] window) {
+    private double accumulate(int[] window) { return accumulate(window, null); }
+
+    /**
+     * Same, but only the positions i with counted[i] == true are scored: the model still reads every token, but only the
+     * prediction of window[i+1] for those i contributes to the loss (averaged over the counted positions) and to the gradient.
+     * counted == null means every position counts, exactly as before. A window with no counted position adds nothing and returns 0.
+     */
+    private double accumulate(int[] window, boolean[] counted) {
         int n = window.length - 1;
+        int m = n;
+        if (counted != null) { m = 0; for (int i = 0; i < n; i++) if (counted[i]) m++; }
+        if (m == 0) return 0;
         Matrix F = forwardLayers(embed(window, n));
         Matrix logits = F.multiply(Wout);
 
         Matrix dLogits = new Matrix(n, vocabSize);
         double loss = 0;
         for (int i = 0; i < n; i++) {
+            if (counted != null && !counted[i]) continue;          // this row of dLogits stays zero
             double[] probs = softmaxRow(logits, i);
             int target = window[i + 1];
             loss -= Math.log(probs[target] + 1e-9);
-            for (int v = 0; v < vocabSize; v++) dLogits.set(i, v, (probs[v] - (v == target ? 1.0 : 0.0)) / n);
+            for (int v = 0; v < vocabSize; v++) dLogits.set(i, v, (probs[v] - (v == target ? 1.0 : 0.0)) / m);
         }
         pOut.addGrad(F.transposeMultiply(dLogits));
         Matrix dCurrent = dLogits.multiplyByTranspose(Wout);
@@ -189,7 +200,7 @@ public class MultiLayerTransformer {
             double[] row = pEmb.g[window[i]];
             for (int k = 0; k < d; k++) row[k] += dCurrent.get(i, k);
         }
-        return loss / n;
+        return loss / m;
     }
 
     private void zeroGrad() { for (Param p : params) p.zeroGrad(); }
@@ -208,12 +219,15 @@ public class MultiLayerTransformer {
      * One training step on a batch of windows: the gradients of all windows are averaged and ONE Adam update is made.
      * With setThreads(n) the windows are processed by n threads at once. Returns the average loss (per token) of the batch.
      */
-    public double trainBatch(int[][] windows) {
+    public double trainBatch(int[][] windows) { return trainBatch(windows, null); }
+
+    /** Same, scoring only the positions marked in counted[window][position] (see accumulate); counted == null scores everything. */
+    public double trainBatch(int[][] windows, boolean[][] counted) {
         int B = windows.length;
         if (threads <= 1) {
             zeroGrad();
             double loss = 0;
-            for (int[] w : windows) loss += accumulate(w);
+            for (int j = 0; j < B; j++) loss += accumulate(windows[j], counted == null ? null : counted[j]);
             for (Param p : params) { p.scaleGrad(1.0 / B); p.step(learningRate); }
             return loss / B;
         }
@@ -224,7 +238,7 @@ public class MultiLayerTransformer {
             wk.zeroGrad();
             double s = 0;
             int j;
-            while ((j = next.getAndIncrement()) < B) s += wk.accumulate(windows[j]);
+            while ((j = next.getAndIncrement()) < B) s += wk.accumulate(windows[j], counted == null ? null : counted[j]);
             partial[id] = s;
         });
         // Phase 2: each block of weights is combined across workers, averaged and updated by exactly one thread.
@@ -250,20 +264,28 @@ public class MultiLayerTransformer {
     }
 
     /** Forward pass only, same average loss as trainSequence (used for gradient checking). */
-    public double sequenceLoss(int[] window) {
+    public double sequenceLoss(int[] window) { return sequenceLoss(window, null); }
+
+    /** Forward pass only: the loss that accumulate(window, counted) averages (0 if no position counts). */
+    public double sequenceLoss(int[] window, boolean[] counted) {
         int n = window.length - 1;
+        int m = n;
+        if (counted != null) { m = 0; for (int i = 0; i < n; i++) if (counted[i]) m++; }
+        if (m == 0) return 0;
         Matrix logits = forwardLayers(embed(window, n)).multiply(Wout);
         double loss = 0;
-        for (int i = 0; i < n; i++) loss -= Math.log(softmaxRow(logits, i)[window[i + 1]] + 1e-9);
-        return loss / n;
+        for (int i = 0; i < n; i++) if (counted == null || counted[i]) loss -= Math.log(softmaxRow(logits, i)[window[i + 1]] + 1e-9);
+        return loss / m;
     }
 
     public double sequenceLoss(String window) { return sequenceLoss(tokenizer.encode(window)); }
 
     /** Average of sequenceLoss over the windows (what trainBatch's gradient is the derivative of). */
-    public double batchLoss(int[][] windows) {
+    public double batchLoss(int[][] windows) { return batchLoss(windows, null); }
+
+    public double batchLoss(int[][] windows, boolean[][] counted) {
         double s = 0;
-        for (int[] w : windows) s += sequenceLoss(w);
+        for (int j = 0; j < windows.length; j++) s += sequenceLoss(windows[j], counted == null ? null : counted[j]);
         return s / windows.length;
     }
 
@@ -309,6 +331,35 @@ public class MultiLayerTransformer {
         double sum = 0;
         long chars = 0;                                   // summed in a fixed order, so the result does not depend on the thread count
         for (int i = 0; i < count; i++) { sum += losses[i]; chars += tokenizer.tokenText(ids[firstPosition + i * step]).length(); }
+        return sum / chars;
+    }
+
+    /**
+     * Like evaluate, but on text that is already tokenized, and only the tokens with counted[position] == true are scored
+     * (counted == null scores every token). Used to score just the bot's replies in a chat transcript.
+     * Returns the average loss per character (in nats) of the scored tokens, or NaN if there is none.
+     */
+    public double evaluateTokens(int[] ids, boolean[] counted, int maxWindows) {
+        int T = contextLength;
+        int[] charStart = new int[ids.length + 1];
+        for (int i = 0; i < ids.length; i++) charStart[i + 1] = charStart[i] + tokenizer.tokenText(ids[i]).length();
+        List<Integer> candidates = new ArrayList<>();
+        for (int p = T; p < ids.length; p++) if (charStart[p] >= EVAL_START && (counted == null || counted[p])) candidates.add(p);
+        if (candidates.isEmpty()) return Double.NaN;
+        int stride = Math.max(1, candidates.size() / maxWindows);
+        int count = (candidates.size() + stride - 1) / stride;
+        double[] losses = new double[count];
+        final int step = stride;
+        if (threads <= 1) {
+            for (int i = 0; i < count; i++) losses[i] = positionLoss(ids, candidates.get(i * step));
+        } else {
+            runOnWorkers((wk, id) -> {
+                for (int i = id; i < count; i += workers.length) losses[i] = wk.positionLoss(ids, candidates.get(i * step));
+            });
+        }
+        double sum = 0;
+        long chars = 0;
+        for (int i = 0; i < count; i++) { sum += losses[i]; chars += tokenizer.tokenText(ids[candidates.get(i * step)]).length(); }
         return sum / chars;
     }
 

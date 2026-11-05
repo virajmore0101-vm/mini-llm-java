@@ -44,6 +44,7 @@ public class GradCheck {
         run("CHARACTER-LEVEL MODEL", text, null);
         checked = 0; bad = 0; worst = 0; maxGrad = 0;
         run("WORD-PIECE (BPE) MODEL, 300 tokens", text, Tokenizer.train(text, 300));
+        chatMaskChecks();
     }
 
     static void run(String label, String text, Tokenizer tok) {
@@ -181,6 +182,115 @@ public class GradCheck {
             System.out.println("CHECKPOINT, save and reload: " + e + " (FAIL)");
         } finally {
             tmp.delete();
+        }
+
+        // 5) loss masks (loss=bot): scoring only some positions must give the true derivative of that masked loss, with any thread count
+        int before5 = checked, bad5 = bad;
+        worst = 0; maxGrad = 0;
+        Random mr = new Random(5);
+        int[][] mb = new int[NB][];
+        boolean[][] mk = new boolean[NB][T], allTrue = new boolean[NB][T];
+        for (int i = 0; i < NB; i++) {
+            mb[i] = Arrays.copyOfRange(allIds, 3000 + 257 * i, 3000 + 257 * i + T + 1);
+            for (int j = 0; j < T; j++) mk[i][j] = mr.nextBoolean();
+            Arrays.fill(allTrue[i], true);
+        }
+        Arrays.fill(mk[NB - 1], false);                      // one window with nothing to score: it must add nothing
+        Adam.PLAIN_SGD_FOR_GRADIENT_CHECK = true;
+
+        // 5a) an all-true mask is exactly the same as no mask
+        MultiLayerTransformer n1 = make(tok, text, T, D, L, H), n2 = make(tok, text, T, D, L, H);
+        double lossNoMask = n1.trainBatch(mb), lossAllTrue = n2.trainBatch(mb, allTrue);
+        double maskDiff = maxDifference(n1, n2);
+        boolean sameLoss = n1.batchLoss(mb) == n1.batchLoss(mb, allTrue);
+        System.out.printf("MASK, all positions marked vs no mask: loss %.12f vs %.12f, largest weight difference %.1e, forward loss identical %b %s%n",
+            lossNoMask, lossAllTrue, maskDiff, sameLoss, maskDiff == 0 && lossNoMask == lossAllTrue && sameLoss ? "(OK)" : "(FAIL)");
+
+        // 5b) a mask that marks one position scores exactly that position (its loss is what the prefix windows say it is)
+        double worstOne = 0;
+        for (int i : new int[] { 0, 3, T - 1 }) {
+            boolean[] one = new boolean[T];
+            one[i] = true;
+            double masked = n1.sequenceLoss(mb[0], one);
+            double expected = (i + 1) * n1.sequenceLoss(Arrays.copyOfRange(mb[0], 0, i + 2)) - (i > 0 ? i * n1.sequenceLoss(Arrays.copyOfRange(mb[0], 0, i + 1)) : 0);
+            worstOne = Math.max(worstOne, Math.abs(masked - expected));
+        }
+        System.out.printf("MASK, one marked position: largest difference from the loss of that position alone = %.1e %s%n", worstOne, worstOne < 1e-9 ? "(OK)" : "(FAIL)");
+
+        // 5c) masked batch: analytic gradient (3 threads) vs numerical derivative of the masked batch loss, and 1 thread vs 3 threads
+        MultiLayerTransformer liveM = make(tok, text, T, D, L, H), singleM = make(tok, text, T, D, L, H), multiM = make(tok, text, T, D, L, H);
+        multiM.setThreads(3);
+        double[][][] wm0 = snapshot(multiM);
+        double lossSingleM = singleM.trainBatch(mb, mk), lossMultiM = multiM.trainBatch(mb, mk);
+        DoubleSupplier maskedLoss = () -> liveM.batchLoss(mb, mk);
+        int smaller5 = 0;
+        for (int i = 0; i < multiM.params.size(); i++) {
+            double[][] w = liveM.params.get(i).w;
+            for (int t = 0; t < 3; t++) {
+                int r5 = pick.nextInt(w.length), c5 = pick.nextInt(w[0].length);
+                double analytic = (wm0[i][r5][c5] - multiM.params.get(i).w[r5][c5]) / lr;
+                double numeric = slope(w, r5, c5, 1e-5, maskedLoss);
+                for (double eps = 1e-6; eps >= 1e-8 && disagrees(analytic, numeric, 1e-5); eps /= 10) { numeric = slope(w, r5, c5, eps, maskedLoss); smaller5++; }
+                cmp("masked.param" + i + "[" + r5 + "," + c5 + "]", analytic, numeric);
+            }
+        }
+        double diffM = maxDifference(singleM, multiM);
+        Adam.PLAIN_SGD_FOR_GRADIENT_CHECK = false;
+        System.out.printf("MASKED BATCH GRADIENTS (batch of %d, about half the positions marked, one window with none, 3 threads): %d weights checked, %d mismatches, worst relative error %.1e %s%n",
+            NB, checked - before5, bad - bad5, worst, bad == bad5 ? "(OK)" : "(FAIL)");
+        System.out.printf("MASKED, 1 THREAD vs 3 THREADS: loss %.12f vs %.12f, largest weight difference %.1e %s%n",
+            lossSingleM, lossMultiM, diffM, diffM < 1e-12 && Math.abs(lossSingleM - lossMultiM) < 1e-12 ? "(OK)" : "(FAIL)");
+
+        // 5d) evaluateTokens: without a mask it equals evaluate; with one marked token it equals that token's own loss
+        MultiLayerTransformer ev = make(tok, text, T, D, L, H);
+        String heldOut5 = text.substring(10000, 12000);
+        int[] hid = coder.encode(heldOut5);
+        double eFull = ev.evaluate(heldOut5, 100), eTokens = ev.evaluateTokens(hid, null, 100);
+        int pos = 90;
+        boolean[] only = new boolean[hid.length];
+        only[pos] = true;
+        double single1 = ev.evaluateTokens(hid, only, 1) * coder.tokenText(hid[pos]).length();
+        int[] w1 = Arrays.copyOfRange(hid, pos - T, pos + 1);
+        double expect1 = T * ev.sequenceLoss(w1) - (T - 1) * ev.sequenceLoss(Arrays.copyOfRange(w1, 0, T));
+        System.out.printf("EVALUATE with masks: no mask %.12f vs evaluate %.12f; one token %.9f vs %.9f %s%n", eTokens, eFull, single1, expect1,
+            eTokens == eFull && Math.abs(single1 - expect1) < 1e-9 ? "(OK)" : "(FAIL)");
+    }
+
+    /** loss=bot: which characters and tokens of a chat transcript are marked as the bot's reply. */
+    static void chatMaskChecks() {
+        System.out.println("--- CHAT TRANSCRIPT MASKS (loss=bot) ---");
+        String chat = "User: Hi there!\nBot: Hello! How are you?\nUser: I am fine.\nBot: Good to hear.\n=====\n\nUser: Bye\nBot: See you.\n";
+        boolean[] f = ChatTransformer.botFlags(chat);
+        StringBuilder marked = new StringBuilder();
+        for (int i = 0; i < chat.length(); i++) if (f[i]) marked.append(chat.charAt(i));
+        String want = " Hello! How are you?\n Good to hear.\n See you.\n";
+        System.out.printf("MARKED CHARACTERS: %s %s%n", marked.toString().replace("\n", "\\n"), marked.toString().equals(want) ? "(OK)" : "(FAIL: wanted " + want.replace("\n", "\\n") + ")");
+
+        boolean[] cut = ChatTransformer.botFlags("ot: Hi\nBot: Yo\n");
+        StringBuilder cutMarked = new StringBuilder();
+        String cutText = "ot: Hi\nBot: Yo\n";
+        for (int i = 0; i < cutText.length(); i++) if (cut[i]) cutMarked.append(cutText.charAt(i));
+        System.out.printf("CUT-OFF FIRST LINE counts as not-bot: marked %s %s%n", cutMarked.toString().replace("\n", "\\n"), cutMarked.toString().equals(" Yo\n") ? "(OK)" : "(FAIL)");
+
+        String big = chat.repeat(30);
+        boolean[] bigFlags = ChatTransformer.botFlags(big);
+        for (int variant = 0; variant < 2; variant++) {
+            Tokenizer tk = variant == 0 ? Tokenizer.chars(big) : Tokenizer.train(big, 300);
+            int[] ids = tk.encode(big);
+            boolean[] mask = ChatTransformer.tokenMask(big, bigFlags, tk, ids);
+            int straddle = 0, pos = 0;
+            StringBuilder fromTokens = new StringBuilder(), fromChars = new StringBuilder();
+            for (int i = 0; i < ids.length; i++) {
+                String piece = tk.tokenText(ids[i]);
+                boolean first = bigFlags[pos];
+                for (int k = 0; k < piece.length(); k++) if (bigFlags[pos + k] != first) { straddle++; break; }
+                if (mask[i]) fromTokens.append(piece);
+                pos += piece.length();
+            }
+            for (int i = 0; i < big.length(); i++) if (bigFlags[i]) fromChars.append(big.charAt(i));
+            boolean ok = straddle == 0 && fromTokens.toString().equals(fromChars.toString());
+            System.out.printf("TOKEN MASK, %s: %d tokens, %d straddling a reply boundary, marked tokens spell exactly the marked characters %b %s%n",
+                variant == 0 ? "character-level" : "word-piece (BPE)", ids.length, straddle, fromTokens.toString().equals(fromChars.toString()), ok ? "(OK)" : "(FAIL)");
         }
     }
 
